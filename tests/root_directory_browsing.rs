@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -66,6 +66,219 @@ async fn test_should_download_file_resource_for_anonymous_http_request() -> Resu
     assert_eq!(body.as_ref(), b"hello from storage root");
     let storage_root_text = storage_root.path().to_string_lossy();
     assert!(!String::from_utf8_lossy(&body).contains(storage_root_text.as_ref()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_download_directory_archive_with_top_level_directory_for_anonymous_http_request()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir_all(storage_root.path().join("docs").join("guides"))
+        .await
+        .context("create nested directory")?;
+    fs::write(
+        storage_root
+            .path()
+            .join("docs")
+            .join("guides")
+            .join("setup.txt"),
+        b"nested setup",
+    )
+    .await
+    .context("write nested file")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_archive(app, "docs").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_DISPOSITION),
+        Some(&header::HeaderValue::from_static(
+            "attachment; filename=\"docs.zip\"; filename*=UTF-8''docs.zip",
+        )),
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static("application/zip")),
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read archive response body")?;
+    let entries = zip_entry_names(body.as_ref())?;
+
+    assert_eq!(
+        entries,
+        vec!["docs/", "docs/guides/", "docs/guides/setup.txt"]
+    );
+    assert_eq!(
+        zip_entry_text(body.as_ref(), "docs/guides/setup.txt")?,
+        "nested setup",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_root_directory_archive_download() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_archive(app, "").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "root_directory_archive").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_archive_path_traversal_and_absolute_resource_paths() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+
+    let traversal = request_archive(app.clone(), "..").await?;
+    assert_error(traversal, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+
+    let absolute = request_archive(app, "%2Ftmp").await?;
+    assert_error(absolute, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_archive_from_reserved_staging_directory() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join(".fh-staging"))
+        .await
+        .context("create reserved staging directory")?;
+    fs::write(
+        storage_root.path().join(".fh-staging").join("internal.txt"),
+        b"internal",
+    )
+    .await
+    .context("write staging internal file")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_archive(app, ".fh-staging").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_file_resource_path_for_directory_archive_download() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(storage_root.path().join("readme.txt"), b"readme")
+        .await
+        .context("write file resource")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_archive(app, "readme.txt").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "not_directory").await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_reject_symlink_directory_resource_archive_download() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    fs::write(outside.path().join("secret.txt"), b"secret")
+        .await
+        .context("write outside file")?;
+    tokio::fs::symlink(outside.path(), storage_root.path().join("outside-link"))
+        .await
+        .context("create symlink directory")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_archive(app, "outside-link").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "not_directory").await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_exclude_nested_symlinks_from_directory_archive() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    fs::create_dir(storage_root.path().join("docs"))
+        .await
+        .context("create docs directory")?;
+    fs::write(
+        storage_root.path().join("docs").join("visible.txt"),
+        b"visible",
+    )
+    .await
+    .context("write visible file")?;
+    fs::write(outside.path().join("secret.txt"), b"secret")
+        .await
+        .context("write outside file")?;
+    tokio::fs::symlink(
+        outside.path().join("secret.txt"),
+        storage_root.path().join("docs").join("secret-link.txt"),
+    )
+    .await
+    .context("create nested symlink")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_archive(app, "docs").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read archive response body")?;
+    let entries = zip_entry_names(body.as_ref())?;
+
+    assert_eq!(entries, vec!["docs/", "docs/visible.txt"]);
+    let archive_text = String::from_utf8_lossy(body.as_ref());
+    assert!(!archive_text.contains("secret"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_fail_directory_archive_before_response_bytes_when_resource_count_limit_is_exceeded()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join("docs"))
+        .await
+        .context("create docs directory")?;
+    fs::write(storage_root.path().join("docs").join("one.txt"), b"one")
+        .await
+        .context("write file resource")?;
+
+    let app =
+        app_from_storage_root_with_archive_limits(storage_root.path(), 10, 1, 1024, "UTC").await?;
+    let response = request_archive(app, "docs").await?;
+
+    assert_error(
+        response,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "archive_resource_count_limit_exceeded",
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_fail_directory_archive_before_response_bytes_when_size_limit_is_exceeded()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join("docs"))
+        .await
+        .context("create docs directory")?;
+    fs::write(storage_root.path().join("docs").join("large.txt"), b"large")
+        .await
+        .context("write file resource")?;
+
+    let app =
+        app_from_storage_root_with_archive_limits(storage_root.path(), 10, 100, 4, "UTC").await?;
+    let response = request_archive(app, "docs").await?;
+
+    assert_error(
+        response,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "archive_size_limit_exceeded",
+    )
+    .await?;
     Ok(())
 }
 
@@ -672,9 +885,55 @@ async fn test_should_render_browser_file_resource_open_as_download_flow() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn test_should_render_browser_directory_archive_action_separate_from_directory_open()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .context("build browser request")?,
+        )
+        .await
+        .context("send browser request")?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read browser response body")?;
+    let body = String::from_utf8(body.to_vec()).context("browser body must be UTF-8")?;
+
+    assert!(body.contains("function downloadDirectoryArchive(resourcePath)"));
+    assert!(body.contains("'/api/archive?path=' + encodeURIComponent(resourcePath)"));
+    assert!(body.contains("downloadDirectoryArchive(resource.resourcePath)"));
+    assert!(body.contains("Download archive"));
+    Ok(())
+}
+
 async fn app_from_storage_root(
     storage_root: &Path,
     listing_limit: usize,
+    time_zone: &str,
+) -> Result<axum::Router> {
+    app_from_storage_root_with_archive_limits(
+        storage_root,
+        listing_limit,
+        100,
+        1_048_576,
+        time_zone,
+    )
+    .await
+}
+
+async fn app_from_storage_root_with_archive_limits(
+    storage_root: &Path,
+    listing_limit: usize,
+    archive_resource_count_limit: usize,
+    archive_uncompressed_size_limit_bytes: u64,
     time_zone: &str,
 ) -> Result<axum::Router> {
     let config_dir = TempDir::new().context("create temporary config directory")?;
@@ -688,6 +947,8 @@ server:
   time_zone: "{time_zone}"
 limits:
   listing_direct_child_limit: {listing_limit}
+  archive_resource_count_limit: {archive_resource_count_limit}
+  archive_uncompressed_size_limit_bytes: {archive_uncompressed_size_limit_bytes}
   request_timeout_seconds: 5
   fs_concurrency_limit: 4
 "#,
@@ -839,6 +1100,38 @@ async fn request_download_without_path(app: axum::Router) -> Result<axum::respon
     )
     .await
     .context("send download request")
+}
+
+async fn request_archive(app: axum::Router, path: &str) -> Result<axum::response::Response> {
+    app.oneshot(
+        Request::builder()
+            .uri(format!("/api/archive?path={path}"))
+            .body(Body::empty())
+            .context("build archive request")?,
+    )
+    .await
+    .context("send archive request")
+}
+
+fn zip_entry_names(bytes: &[u8]) -> Result<Vec<String>> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader).context("open archive")?;
+    let mut names = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let file = archive.by_index(index).context("read archive entry")?;
+        names.push(file.name().to_owned());
+    }
+    Ok(names)
+}
+
+fn zip_entry_text(bytes: &[u8], name: &str) -> Result<String> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader).context("open archive")?;
+    let mut file = archive.by_name(name).context("find archive entry")?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .context("read archive entry text")?;
+    Ok(text)
 }
 
 async fn assert_error(

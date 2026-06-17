@@ -2,6 +2,7 @@
 name = "file-hub"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow = "1.0.102"
@@ -19,6 +20,7 @@ tower-http = { version = "0.7.0", features = ["timeout"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 validator = { version = "0.20.0", default-features = false }
+zip = { version = "8.6.0", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2.29"

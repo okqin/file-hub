@@ -2,7 +2,7 @@
 
 use std::{
     net::SocketAddr,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
 };
 
@@ -33,6 +33,8 @@ pub struct ServerConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeLimits {
     listing_direct_child_limit: NonZeroUsize,
+    archive_resource_count_limit: NonZeroUsize,
+    archive_uncompressed_size_limit_bytes: NonZeroU64,
     request_timeout_seconds: NonZeroUsize,
     fs_concurrency_limit: NonZeroUsize,
 }
@@ -90,6 +92,8 @@ struct RawServerConfig {
 #[serde(deny_unknown_fields)]
 struct RawRuntimeLimits {
     listing_direct_child_limit: usize,
+    archive_resource_count_limit: usize,
+    archive_uncompressed_size_limit_bytes: u64,
     request_timeout_seconds: usize,
     fs_concurrency_limit: usize,
 }
@@ -128,6 +132,20 @@ impl Validate for RawRuntimeLimits {
             self.listing_direct_child_limit,
             1,
             100_000,
+        );
+        add_range_error(
+            &mut errors,
+            "archive_resource_count_limit",
+            self.archive_resource_count_limit,
+            1,
+            1_000_000,
+        );
+        add_u64_range_error(
+            &mut errors,
+            "archive_uncompressed_size_limit_bytes",
+            self.archive_uncompressed_size_limit_bytes,
+            1,
+            1_099_511_627_776,
         );
         add_range_error(
             &mut errors,
@@ -193,6 +211,14 @@ impl AppConfig {
                 raw.limits.listing_direct_child_limit,
                 "limits.listing_direct_child_limit",
             )?,
+            archive_resource_count_limit: non_zero(
+                raw.limits.archive_resource_count_limit,
+                "limits.archive_resource_count_limit",
+            )?,
+            archive_uncompressed_size_limit_bytes: non_zero_u64(
+                raw.limits.archive_uncompressed_size_limit_bytes,
+                "limits.archive_uncompressed_size_limit_bytes",
+            )?,
             request_timeout_seconds: non_zero(
                 raw.limits.request_timeout_seconds,
                 "limits.request_timeout_seconds",
@@ -257,6 +283,18 @@ impl RuntimeLimits {
         self.listing_direct_child_limit
     }
 
+    /// Return the maximum resource count in one Directory Archive.
+    #[must_use]
+    pub const fn archive_resource_count_limit(self) -> NonZeroUsize {
+        self.archive_resource_count_limit
+    }
+
+    /// Return the maximum uncompressed byte size in one Directory Archive.
+    #[must_use]
+    pub const fn archive_uncompressed_size_limit_bytes(self) -> NonZeroU64 {
+        self.archive_uncompressed_size_limit_bytes
+    }
+
     /// Return the request timeout in seconds.
     #[must_use]
     pub const fn request_timeout_seconds(self) -> NonZeroUsize {
@@ -276,6 +314,10 @@ fn default_staging_directory_name() -> String {
 
 fn non_zero(value: usize, field: &'static str) -> Result<NonZeroUsize, AppConfigError> {
     NonZeroUsize::new(value).ok_or(AppConfigError::ZeroLimit { field })
+}
+
+fn non_zero_u64(value: u64, field: &'static str) -> Result<NonZeroU64, AppConfigError> {
+    NonZeroU64::new(value).ok_or(AppConfigError::ZeroLimit { field })
 }
 
 fn is_valid_resource_name(name: &str) -> bool {
@@ -307,6 +349,18 @@ fn add_range_error(
     value: usize,
     min: usize,
     max: usize,
+) {
+    if value < min || value > max {
+        errors.add(field, ValidationError::new("range"));
+    }
+}
+
+fn add_u64_range_error(
+    errors: &mut ValidationErrors,
+    field: &'static str,
+    value: u64,
+    min: u64,
+    max: u64,
 ) {
     if value < min || value > max {
         errors.add(field, ValidationError::new("range"));
