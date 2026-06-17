@@ -48,6 +48,9 @@ struct AppState {
 #[serde(deny_unknown_fields)]
 struct ListQuery {
     path: Option<String>,
+    sort: Option<resource::SortField>,
+    order: Option<resource::SortOrder>,
+    filter: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,32 +80,43 @@ async fn list_root_directory(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<resource::DirectoryListing>, ApiError> {
-    if query.path.as_deref().is_some_and(|path| !path.is_empty()) {
-        return Err(ApiError::bad_request(
-            "unsupported_resource_path",
-            "this slice only supports Root Directory listing",
-        ));
-    }
-
-    resource::list_root_directory(&state.config)
+    let path = query.path.as_deref().unwrap_or_default();
+    let sort = resource::ListingSort {
+        field: query.sort.unwrap_or(resource::SortField::Name),
+        order: query.order.unwrap_or(resource::SortOrder::Asc),
+    };
+    let filter = resource::CurrentListFilter {
+        query: query.filter.unwrap_or_default(),
+    };
+    resource::list_directory(&state.config, path, sort, filter)
         .await
         .map(Json)
         .map_err(ApiError::from)
 }
 
-impl ApiError {
-    fn bad_request(code: &'static str, reason: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code,
-            reason: reason.into(),
-        }
-    }
-}
-
 impl From<resource::ResourceError> for ApiError {
     fn from(error: resource::ResourceError) -> Self {
         match error {
+            resource::ResourceError::InvalidResourcePath => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_resource_path",
+                reason: "resource path is invalid".to_owned(),
+            },
+            resource::ResourceError::InvalidFilter => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_filter",
+                reason: "current list filter query is invalid".to_owned(),
+            },
+            resource::ResourceError::NotDirectory => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "not_directory",
+                reason: "resource path is not a directory".to_owned(),
+            },
+            resource::ResourceError::ResourceNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "resource_not_found",
+                reason: "resource path does not exist".to_owned(),
+            },
             resource::ResourceError::ListingLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "listing_limit_exceeded",
@@ -113,13 +127,13 @@ impl From<resource::ResourceError> for ApiError {
                 code: "invalid_resource_name",
                 reason: "resource name is not valid UTF-8".to_owned(),
             },
-            resource::ResourceError::ReadRoot(_)
+            resource::ResourceError::ReadDirectory(_)
             | resource::ResourceError::ReadEntry(_)
             | resource::ResourceError::Metadata(_)
             | resource::ResourceError::ModifiedTime(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "resource_listing_failed",
-                reason: "failed to list Root Directory".to_owned(),
+                reason: "failed to list Directory".to_owned(),
             },
         }
     }
@@ -200,6 +214,62 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .name {
       font-weight: 600;
     }
+    .toolbar,
+    .breadcrumb {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .toolbar {
+      justify-content: space-between;
+    }
+    .filter {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    label {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    input {
+      min-width: 260px;
+      padding: 8px 10px;
+      border: 1px solid #d8dee4;
+      border-radius: 6px;
+      font: inherit;
+    }
+    button {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #0969da;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover {
+      text-decoration: underline;
+    }
+    button[hidden] {
+      display: none;
+    }
+    .parent {
+      padding: 7px 10px;
+      border: 1px solid #d8dee4;
+      border-radius: 6px;
+      background: #fff;
+    }
+    .sort-button {
+      color: #1f2328;
+      font-weight: 600;
+    }
+    .sort-direction {
+      margin-left: 4px;
+      color: #57606a;
+      font-size: 12px;
+    }
     .muted {
       color: #57606a;
     }
@@ -215,14 +285,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <h1>File Hub</h1>
       <div class="identity">Anonymous</div>
     </header>
+    <nav aria-label="Breadcrumb" class="breadcrumb" id="breadcrumb"></nav>
+    <div class="toolbar">
+      <button type="button" id="return-to-parent" class="parent" hidden>Return to parent</button>
+      <div class="filter">
+        <label for="current-list-filter">Current List Filter</label>
+        <input id="current-list-filter" type="search" autocomplete="off">
+      </div>
+    </div>
     <section aria-label="Root Directory">
       <table>
         <thead>
           <tr>
-            <th>Name</th>
+            <th><button type="button" class="sort-button" data-sort-field="name">Name<span class="sort-direction" data-sort-indicator="name"></span></button></th>
             <th>Kind</th>
-            <th>Size</th>
-            <th>Modified</th>
+            <th><button type="button" class="sort-button" data-sort-field="size">Size<span class="sort-direction" data-sort-indicator="size"></span></button></th>
+            <th><button type="button" class="sort-button" data-sort-field="modifiedTime">Modified<span class="sort-direction" data-sort-indicator="modifiedTime"></span></button></th>
           </tr>
         </thead>
         <tbody id="resources">
@@ -234,9 +312,92 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <script>
     (function () {
       var resources = document.getElementById('resources');
+      var breadcrumb = document.getElementById('breadcrumb');
+      var returnToParent = document.getElementById('return-to-parent');
+      var filter = document.getElementById('current-list-filter');
+      var sortButtons = Array.prototype.slice.call(document.querySelectorAll('[data-sort-field]'));
+      var sortIndicators = Array.prototype.slice.call(document.querySelectorAll('[data-sort-indicator]'));
+      var state = {
+        path: '',
+        sort: 'name',
+        order: 'asc',
+        filter: ''
+      };
 
       function text(value) {
         return document.createTextNode(value == null ? '' : String(value));
+      }
+
+      function parentPath(path) {
+        var index = path.lastIndexOf('/');
+        if (index === -1) {
+          return '';
+        }
+        return path.slice(0, index);
+      }
+
+      function loadDirectory(path) {
+        state.path = path || '';
+        var query = [
+          'path=' + encodeURIComponent(state.path),
+          'sort=' + encodeURIComponent(state.sort),
+          'order=' + encodeURIComponent(state.order),
+          'filter=' + encodeURIComponent(state.filter)
+        ].join('&');
+
+        fetch('/api/list' + (query ? '?' + query : ''))
+          .then(function (response) {
+            return response.json().then(function (body) {
+              if (!response.ok) {
+                throw new Error(body.error && body.error.reason ? body.error.reason : 'Listing failed');
+              }
+              return body;
+            });
+          })
+          .then(function (body) {
+            state.path = body.path || '';
+            renderBreadcrumb(body.breadcrumbs || []);
+            renderParentAction();
+            renderSort(body.sort || { field: state.sort, order: state.order });
+            renderRows(body.resources || []);
+          })
+          .catch(function (error) {
+            renderError(error.message);
+          });
+      }
+
+      function renderBreadcrumb(segments) {
+        breadcrumb.textContent = '';
+        segments.forEach(function (segment, index) {
+          if (index > 0) {
+            breadcrumb.appendChild(text('/'));
+          }
+          var button = document.createElement('button');
+          button.type = 'button';
+          button.appendChild(text(segment.label));
+          button.addEventListener('click', function () {
+            loadDirectory(segment.path);
+          });
+          breadcrumb.appendChild(button);
+        });
+      }
+
+      function renderParentAction() {
+        if (!state.path) {
+          returnToParent.hidden = true;
+          return;
+        }
+
+        returnToParent.hidden = false;
+      }
+
+      function renderSort(sort) {
+        state.sort = sort.field || state.sort;
+        state.order = sort.order || state.order;
+        sortIndicators.forEach(function (indicator) {
+          var field = indicator.getAttribute('data-sort-indicator');
+          indicator.textContent = field === state.sort ? state.order : '';
+        });
       }
 
       function renderRows(rows) {
@@ -256,7 +417,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
           var row = document.createElement('tr');
           var name = document.createElement('td');
           name.className = 'name';
-          name.appendChild(text(resource.name));
+          if (resource.kind === 'directory') {
+            var open = document.createElement('button');
+            open.type = 'button';
+            open.appendChild(text(resource.name));
+            open.addEventListener('click', function () {
+              loadDirectory(resource.resourcePath);
+            });
+            name.appendChild(open);
+          } else {
+            name.appendChild(text(resource.name));
+          }
           var kind = document.createElement('td');
           kind.appendChild(text(resource.kind));
           var size = document.createElement('td');
@@ -282,22 +453,30 @@ const INDEX_HTML: &str = r#"<!doctype html>
         resources.appendChild(row);
       }
 
-      fetch('/api/list')
-        .then(function (response) {
-          return response.json().then(function (body) {
-            if (!response.ok) {
-              throw new Error(body.error && body.error.reason ? body.error.reason : 'Listing failed');
-            }
-            return body;
-          });
-        })
-        .then(function (body) {
-          renderRows(body.resources || []);
-        })
-        .catch(function (error) {
-          renderError(error.message);
+      returnToParent.addEventListener('click', function () {
+        loadDirectory(parentPath(state.path));
+      });
+
+      filter.addEventListener('input', function () {
+        state.filter = filter.value;
+        loadDirectory(state.path);
+      });
+
+      sortButtons.forEach(function (button) {
+        button.addEventListener('click', function () {
+          var field = button.getAttribute('data-sort-field');
+          if (state.sort === field) {
+            state.order = state.order === 'asc' ? 'desc' : 'asc';
+          } else {
+            state.sort = field;
+            state.order = 'asc';
+          }
+          loadDirectory(state.path);
         });
-    })();
+      });
+
+      loadDirectory('');
+    }());
   </script>
 </body>
 </html>
