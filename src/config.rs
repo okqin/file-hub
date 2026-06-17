@@ -35,6 +35,8 @@ pub struct RuntimeLimits {
     listing_direct_child_limit: NonZeroUsize,
     archive_resource_count_limit: NonZeroUsize,
     archive_uncompressed_size_limit_bytes: NonZeroU64,
+    search_result_limit: NonZeroUsize,
+    search_traversal_limit: NonZeroUsize,
     request_timeout_seconds: NonZeroUsize,
     fs_concurrency_limit: NonZeroUsize,
 }
@@ -94,6 +96,8 @@ struct RawRuntimeLimits {
     listing_direct_child_limit: usize,
     archive_resource_count_limit: usize,
     archive_uncompressed_size_limit_bytes: u64,
+    search_result_limit: usize,
+    search_traversal_limit: usize,
     request_timeout_seconds: usize,
     fs_concurrency_limit: usize,
 }
@@ -146,6 +150,20 @@ impl Validate for RawRuntimeLimits {
             self.archive_uncompressed_size_limit_bytes,
             1,
             1_099_511_627_776,
+        );
+        add_range_error(
+            &mut errors,
+            "search_result_limit",
+            self.search_result_limit,
+            1,
+            100_000,
+        );
+        add_range_error(
+            &mut errors,
+            "search_traversal_limit",
+            self.search_traversal_limit,
+            1,
+            1_000_000,
         );
         add_range_error(
             &mut errors,
@@ -218,6 +236,14 @@ impl AppConfig {
             archive_uncompressed_size_limit_bytes: non_zero_u64(
                 raw.limits.archive_uncompressed_size_limit_bytes,
                 "limits.archive_uncompressed_size_limit_bytes",
+            )?,
+            search_result_limit: non_zero(
+                raw.limits.search_result_limit,
+                "limits.search_result_limit",
+            )?,
+            search_traversal_limit: non_zero(
+                raw.limits.search_traversal_limit,
+                "limits.search_traversal_limit",
             )?,
             request_timeout_seconds: non_zero(
                 raw.limits.request_timeout_seconds,
@@ -293,6 +319,18 @@ impl RuntimeLimits {
     #[must_use]
     pub const fn archive_uncompressed_size_limit_bytes(self) -> NonZeroU64 {
         self.archive_uncompressed_size_limit_bytes
+    }
+
+    /// Return the maximum number of Server Search results returned in one response.
+    #[must_use]
+    pub const fn search_result_limit(self) -> NonZeroUsize {
+        self.search_result_limit
+    }
+
+    /// Return the maximum number of Resources traversed by one Server Search.
+    #[must_use]
+    pub const fn search_traversal_limit(self) -> NonZeroUsize {
+        self.search_traversal_limit
     }
 
     /// Return the request timeout in seconds.
