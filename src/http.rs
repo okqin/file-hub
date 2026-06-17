@@ -112,6 +112,11 @@ impl From<resource::ResourceError> for ApiError {
                 code: "not_directory",
                 reason: "resource path is not a directory".to_owned(),
             },
+            resource::ResourceError::ResourceNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "resource_not_found",
+                reason: "resource path does not exist".to_owned(),
+            },
             resource::ResourceError::ListingLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "listing_limit_exceeded",

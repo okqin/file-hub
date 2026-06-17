@@ -119,6 +119,9 @@ pub enum ResourceError {
     /// The requested resource path is not a directory resource.
     #[error("resource path is not a directory")]
     NotDirectory,
+    /// The requested resource path does not exist.
+    #[error("resource path does not exist")]
+    ResourceNotFound,
     /// The configured directory contains more resources than the direct child limit.
     #[error("direct child listing exceeds configured limit of {limit}")]
     ListingLimitExceeded {
@@ -172,6 +175,9 @@ pub async fn list_directory(
     filter: CurrentListFilter,
 ) -> Result<DirectoryListing, ResourceError> {
     let resource_path = ResourcePath::parse(path)?;
+    if resource_path.contains_reserved_name(config.staging_directory_name()) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
     filter.validate()?;
     let directory_path = resolve_directory_path(config.storage_root(), &resource_path).await?;
 
@@ -194,7 +200,9 @@ pub async fn list_directory(
             continue;
         }
 
-        let metadata = entry.metadata().await.map_err(ResourceError::Metadata)?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .await
+            .map_err(ResourceError::Metadata)?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             continue;
@@ -296,6 +304,10 @@ impl<'a> ResourcePath<'a> {
 
         breadcrumbs
     }
+
+    fn contains_reserved_name(&self, reserved_name: &str) -> bool {
+        self.segments.contains(&reserved_name)
+    }
 }
 
 async fn resolve_directory_path(
@@ -307,13 +319,26 @@ async fn resolve_directory_path(
         path.push(segment);
         let metadata = fs::symlink_metadata(&path)
             .await
-            .map_err(ResourceError::ReadDirectory)?;
+            .map_err(map_resolve_error)?;
         if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
             return Err(ResourceError::NotDirectory);
         }
     }
 
-    Ok(path)
+    let canonical = fs::canonicalize(path).await.map_err(map_resolve_error)?;
+    if !canonical.starts_with(storage_root) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+
+    Ok(canonical)
+}
+
+fn map_resolve_error(error: std::io::Error) -> ResourceError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        ResourceError::ResourceNotFound
+    } else {
+        ResourceError::ReadDirectory(error)
+    }
 }
 
 fn is_valid_resource_name(name: &str) -> bool {

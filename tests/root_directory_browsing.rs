@@ -193,6 +193,51 @@ async fn test_should_filter_current_directory_only_while_preserving_sort() -> Re
     Ok(())
 }
 
+#[tokio::test]
+async fn test_should_reject_path_traversal_and_absolute_resource_paths() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+
+    let traversal = request_listing_with_query(app.clone(), "path=..").await?;
+    assert_error(traversal, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+
+    let absolute = request_listing_with_query(app, "path=%2Ftmp").await?;
+    assert_error(absolute, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_direct_access_to_reserved_staging_directory() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join(".fh-staging"))
+        .await
+        .context("create reserved staging directory")?;
+    fs::write(
+        storage_root.path().join(".fh-staging").join("internal.txt"),
+        b"internal",
+    )
+    .await
+    .context("write staging internal file")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_listing(app, Some(".fh-staging")).await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_return_not_found_for_missing_directory_resource_path() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_listing(app, Some("missing")).await?;
+
+    assert_error(response, StatusCode::NOT_FOUND, "resource_not_found").await?;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_should_exclude_symbolic_links_from_root_directory_listing() -> Result<()> {
@@ -212,6 +257,25 @@ async fn test_should_exclude_symbolic_links_from_root_directory_listing() -> Res
     let names = resource_names(&body)?;
 
     assert_eq!(names, vec!["target.txt"]);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_reject_symlink_directory_resource_open() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    fs::write(outside.path().join("secret.txt"), b"secret")
+        .await
+        .context("write outside file")?;
+    tokio::fs::symlink(outside.path(), storage_root.path().join("outside-link"))
+        .await
+        .context("create symlink directory")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_listing(app, Some("outside-link")).await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "not_directory").await?;
     Ok(())
 }
 
@@ -511,15 +575,7 @@ async fn get_listing(app: axum::Router, path: Option<&str>) -> Result<Value> {
 }
 
 async fn get_listing_with_query(app: axum::Router, query: &str) -> Result<Value> {
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/list?{query}"))
-                .body(Body::empty())
-                .context("build list request")?,
-        )
-        .await
-        .context("send list request")?;
+    let response = request_listing_with_query(app, query).await?;
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -527,6 +583,20 @@ async fn get_listing_with_query(app: axum::Router, query: &str) -> Result<Value>
         .await
         .context("read list response body")?;
     serde_json::from_slice(&body).context("parse list response body")
+}
+
+async fn request_listing_with_query(
+    app: axum::Router,
+    query: &str,
+) -> Result<axum::response::Response> {
+    app.oneshot(
+        Request::builder()
+            .uri(format!("/api/list?{query}"))
+            .body(Body::empty())
+            .context("build list request")?,
+    )
+    .await
+    .context("send list request")
 }
 
 async fn request_root_listing(app: axum::Router) -> Result<axum::response::Response> {
@@ -550,4 +620,23 @@ async fn request_listing(
     )
     .await
     .context("send list request")
+}
+
+async fn assert_error(
+    response: axum::response::Response,
+    status: StatusCode,
+    code: &str,
+) -> Result<()> {
+    assert_eq!(response.status(), status);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read error response body")?;
+    let body: Value = serde_json::from_slice(&body).context("parse error response body")?;
+    assert_eq!(
+        body.pointer("/error/code"),
+        Some(&Value::String(code.to_owned()))
+    );
+    assert!(body.pointer("/error/reason").is_some());
+    assert!(body.get("resources").is_none());
+    Ok(())
 }
