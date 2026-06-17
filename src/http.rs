@@ -8,7 +8,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,7 +18,7 @@ use tower_http::timeout::TimeoutLayer;
 use tracing::warn;
 
 use crate::{
-    auth::{AuthError, AuthState, BootstrapPassword, BootstrapReport},
+    auth::{AuthError, AuthState, BootstrapPassword, BootstrapReport, ManagedUser, PermissionSet},
     config::AppConfig,
     resource,
 };
@@ -65,12 +65,28 @@ pub async fn build_router_with_bootstrap_report(
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/password", post(change_password))
-        .route("/api/console/users", post(console_create_user))
+        .route("/console", get(console_view))
+        .route(
+            "/api/console/users",
+            get(console_list_users).post(console_create_user),
+        )
+        .route(
+            "/api/console/anonymous-permissions",
+            get(console_get_anonymous_permissions).patch(console_update_anonymous_permissions),
+        )
         .route(
             "/api/console/users/{username}",
             delete(console_delete_user)
                 .patch(console_rename_user)
                 .put(console_replace_user),
+        )
+        .route(
+            "/api/console/users/{username}/permissions",
+            patch(console_update_user_permissions),
+        )
+        .route(
+            "/api/console/users/{username}/password",
+            post(console_reset_user_password),
         )
         .route("/api/list", get(list_root_directory))
         .route("/api/search", get(search_resources))
@@ -161,8 +177,28 @@ struct PasswordChangeRequest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ConsoleUserRequest {
     username: String,
-    #[allow(dead_code)]
-    password: Option<String>,
+    password: String,
+    permissions: Option<PermissionSetBody>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ConsolePasswordRequest {
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ConsoleRenameUserRequest {
+    username: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PermissionSetBody {
+    upload: bool,
+    rename: bool,
+    delete: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +218,23 @@ struct IdentityActions {
     password_change: bool,
     logout: bool,
     console: bool,
+    upload: bool,
+    rename: bool,
+    delete: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConsoleUsersResponse {
+    users: Vec<ManagedUserResponse>,
+    anonymous_permissions: PermissionSetBody,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedUserResponse {
+    username: String,
+    permissions: PermissionSetBody,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,8 +267,9 @@ async fn identity(
     let token = session_token_from_headers(&headers);
     let identity = state.auth.identity_for_session(token.as_deref()).await?;
 
-    Ok(Json(match identity {
-        Some(identity) => IdentityResponse {
+    Ok(Json(if let Some(identity) = identity {
+        let permissions = identity.permissions();
+        IdentityResponse {
             authenticated: true,
             username: Some(identity.username().to_owned()),
             actions: IdentityActions {
@@ -223,9 +277,14 @@ async fn identity(
                 password_change: true,
                 logout: true,
                 console: identity.is_admin(),
+                upload: permissions.upload(),
+                rename: permissions.rename(),
+                delete: permissions.delete(),
             },
-        },
-        None => IdentityResponse {
+        }
+    } else {
+        let permissions = state.auth.anonymous_permissions().await?;
+        IdentityResponse {
             authenticated: false,
             username: None,
             actions: IdentityActions {
@@ -233,8 +292,11 @@ async fn identity(
                 password_change: false,
                 logout: false,
                 console: false,
+                upload: permissions.upload(),
+                rename: permissions.rename(),
+                delete: permissions.delete(),
             },
-        },
+        }
     }))
 }
 
@@ -289,6 +351,33 @@ async fn change_password(
     Ok(response)
 }
 
+async fn console_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<&'static str>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Html(CONSOLE_HTML))
+}
+
+async fn console_list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ConsoleUsersResponse>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let users = state
+        .auth
+        .list_users()
+        .await?
+        .iter()
+        .map(ManagedUserResponse::from)
+        .collect();
+    let anonymous_permissions = PermissionSetBody::from(state.auth.anonymous_permissions().await?);
+    Ok(Json(ConsoleUsersResponse {
+        users,
+        anonymous_permissions,
+    }))
+}
+
 async fn console_create_user(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -296,7 +385,22 @@ async fn console_create_user(
 ) -> Result<Response, ApiError> {
     require_admin(&state, &headers).await?;
     reject_administrator_target(&request.username)?;
-    Err(ApiError::console_user_management_not_implemented())
+    let permissions = request
+        .permissions
+        .map(PermissionSet::from)
+        .unwrap_or_default();
+    state
+        .auth
+        .create_user_with_permissions(&request.username, &request.password, permissions)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ManagedUserResponse {
+            username: request.username,
+            permissions: PermissionSetBody::from(permissions),
+        }),
+    )
+        .into_response())
 }
 
 async fn console_delete_user(
@@ -306,19 +410,21 @@ async fn console_delete_user(
 ) -> Result<Response, ApiError> {
     require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
-    Err(ApiError::console_user_management_not_implemented())
+    state.auth.delete_user(&username).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn console_rename_user(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
-    Json(request): Json<ConsoleUserRequest>,
+    Json(request): Json<ConsoleRenameUserRequest>,
 ) -> Result<Response, ApiError> {
     require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
     reject_administrator_target(&request.username)?;
-    Err(ApiError::console_user_management_not_implemented())
+    let user = state.auth.rename_user(&username, &request.username).await?;
+    Ok(Json(ManagedUserResponse::from(&user)).into_response())
 }
 
 async fn console_replace_user(
@@ -330,7 +436,68 @@ async fn console_replace_user(
     require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
     reject_administrator_target(&request.username)?;
-    Err(ApiError::console_user_management_not_implemented())
+    let permissions = request
+        .permissions
+        .map(PermissionSet::from)
+        .unwrap_or_default();
+    let user = state
+        .auth
+        .replace_user(&username, &request.username, &request.password, permissions)
+        .await?;
+    Ok(Json(ManagedUserResponse::from(&user)).into_response())
+}
+
+async fn console_update_user_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(username): AxumPath<String>,
+    Json(request): Json<PermissionSetBody>,
+) -> Result<Response, ApiError> {
+    require_admin(&state, &headers).await?;
+    reject_administrator_target(&username)?;
+    let user = state
+        .auth
+        .update_user_permissions(&username, PermissionSet::from(request))
+        .await?;
+    Ok(Json(ManagedUserResponse::from(&user)).into_response())
+}
+
+async fn console_reset_user_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(username): AxumPath<String>,
+    Json(request): Json<ConsolePasswordRequest>,
+) -> Result<Response, ApiError> {
+    require_admin(&state, &headers).await?;
+    reject_administrator_target(&username)?;
+    state
+        .auth
+        .reset_user_password(&username, &request.password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn console_get_anonymous_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PermissionSetBody>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(PermissionSetBody::from(
+        state.auth.anonymous_permissions().await?,
+    )))
+}
+
+async fn console_update_anonymous_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PermissionSetBody>,
+) -> Result<Json<PermissionSetBody>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let permissions = state
+        .auth
+        .set_anonymous_permissions(PermissionSet::from(request))
+        .await?;
+    Ok(Json(PermissionSetBody::from(permissions)))
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -512,8 +679,61 @@ impl From<resource::ResourceError> for ApiError {
 }
 
 impl From<AuthError> for ApiError {
-    fn from(_error: AuthError) -> Self {
-        Self::internal_server_error()
+    fn from(error: AuthError) -> Self {
+        match error {
+            AuthError::InvalidUsername => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_username",
+                reason: "username is invalid".to_owned(),
+            },
+            AuthError::InvalidPassword => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_password",
+                reason: "password is invalid".to_owned(),
+            },
+            AuthError::ReservedAdministrator => Self::reserved_administrator(),
+            AuthError::UsernameConflict => Self {
+                status: StatusCode::CONFLICT,
+                code: "username_conflict",
+                reason: "username already exists".to_owned(),
+            },
+            AuthError::UserNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "user_not_found",
+                reason: "user was not found".to_owned(),
+            },
+            AuthError::Database(_)
+            | AuthError::DatabaseDirectory(_)
+            | AuthError::Random(_)
+            | AuthError::PasswordHash(_)
+            | AuthError::PasswordVerify(_)
+            | AuthError::PasswordTask(_) => Self::internal_server_error(),
+        }
+    }
+}
+
+impl From<PermissionSetBody> for PermissionSet {
+    fn from(value: PermissionSetBody) -> Self {
+        Self::new(value.upload, value.rename, value.delete)
+    }
+}
+
+impl From<PermissionSet> for PermissionSetBody {
+    fn from(value: PermissionSet) -> Self {
+        Self {
+            upload: value.upload(),
+            rename: value.rename(),
+            delete: value.delete(),
+        }
+    }
+}
+
+impl From<&ManagedUser> for ManagedUserResponse {
+    fn from(value: &ManagedUser) -> Self {
+        Self {
+            username: value.username().to_owned(),
+            permissions: PermissionSetBody::from(value.permissions()),
+        }
     }
 }
 
@@ -555,14 +775,6 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "reserved_administrator",
             reason: "Administrator cannot be created, deleted, renamed, or replaced".to_owned(),
-        }
-    }
-
-    fn console_user_management_not_implemented() -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            code: "console_user_management_not_implemented",
-            reason: "Console user management belongs to a later slice".to_owned(),
         }
     }
 }
@@ -657,6 +869,48 @@ fn log_bootstrap_password(report: &BootstrapReport) {
         );
     }
 }
+
+const CONSOLE_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Hub Console</title>
+</head>
+<body>
+  <main aria-label="Console">
+    <h1>Console</h1>
+    <section aria-label="User Management">
+      <form id="create-user-form">
+        <input id="console-username" name="username" autocomplete="off">
+        <input id="console-password" name="password" type="password">
+        <label><input id="console-upload-permission" name="upload" type="checkbox"> Upload Permission</label>
+        <label><input id="console-rename-permission" name="rename" type="checkbox"> Rename Permission</label>
+        <label><input id="console-delete-permission" name="delete" type="checkbox"> Delete Permission</label>
+        <button type="submit" id="create-user-action">Create User</button>
+      </form>
+      <table>
+        <thead>
+          <tr>
+            <th>Username</th>
+            <th>Upload</th>
+            <th>Rename</th>
+            <th>Delete</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="console-users"></tbody>
+      </table>
+    </section>
+    <section aria-label="Default Anonymous Permission Set">
+      <label><input id="anonymous-upload-permission" type="checkbox"> Upload Permission</label>
+      <label><input id="anonymous-rename-permission" type="checkbox"> Rename Permission</label>
+      <label><input id="anonymous-delete-permission" type="checkbox"> Delete Permission</label>
+      <button type="button" id="save-anonymous-permissions">Save Anonymous Permissions</button>
+    </section>
+  </main>
+</body>
+</html>"#;
 
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">

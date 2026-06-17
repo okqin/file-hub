@@ -52,6 +52,22 @@ pub struct LoginSession {
 pub struct Identity {
     username: String,
     is_admin: bool,
+    permissions: PermissionSet,
+}
+
+/// Hub-wide write permissions assigned to a User or Anonymous User.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PermissionSet {
+    upload: bool,
+    rename: bool,
+    delete: bool,
+}
+
+/// Ordinary User visible through the Console management API.
+#[derive(Debug)]
+pub struct ManagedUser {
+    username: String,
+    permissions: PermissionSet,
 }
 
 /// Authentication subsystem errors.
@@ -81,6 +97,12 @@ pub enum AuthError {
     /// The fixed Administrator cannot be created as an ordinary user.
     #[error("administrator cannot be created as an ordinary user")]
     ReservedAdministrator,
+    /// Username already exists.
+    #[error("username already exists")]
+    UsernameConflict,
+    /// User was not found.
+    #[error("user was not found")]
+    UserNotFound,
     /// A blocking password task panicked or was cancelled.
     #[error("password task failed")]
     PasswordTask(#[from] tokio::task::JoinError),
@@ -115,36 +137,335 @@ impl AuthState {
 
     /// Create an ordinary User with an initial Password.
     ///
-    /// This storage-level capability is used by the later Console slice; it intentionally does
-    /// not expose HTTP Console user management in this issue.
+    /// Users created through this helper receive the Default User Permission Set.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid credentials, reserved Administrator username, `SQLite` failure,
     /// or password hashing failure.
     pub async fn create_user(&self, username: &str, password: &str) -> Result<(), AuthError> {
+        self.create_user_with_permissions(username, password, PermissionSet::default())
+            .await
+    }
+
+    /// Create an ordinary User with an initial Password and explicit Permission Set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid credentials, reserved Administrator username, duplicate
+    /// username, `SQLite` failure, or password hashing failure.
+    pub async fn create_user_with_permissions(
+        &self,
+        username: &str,
+        password: &str,
+        permissions: PermissionSet,
+    ) -> Result<(), AuthError> {
         if !is_valid_username(username) {
             return Err(AuthError::InvalidUsername);
         }
-        if normalize_username(username) == ADMIN_USERNAME {
+        let username_normalized = normalize_username(username);
+        if username_normalized == ADMIN_USERNAME {
             return Err(AuthError::ReservedAdministrator);
         }
         if !is_valid_password(password) {
             return Err(AuthError::InvalidPassword);
         }
+        if self.user_exists(&username_normalized).await? {
+            return Err(AuthError::UsernameConflict);
+        }
 
         let password_hash = hash_password(password.to_owned()).await?;
         sqlx::query(
             "INSERT INTO users (username, username_normalized, password_hash, is_admin, \
-             bootstrap_pending) VALUES (?, ?, ?, 0, 0)",
+             bootstrap_pending, can_upload, can_rename, can_delete) VALUES (?, ?, ?, 0, 0, ?, ?, \
+             ?)",
         )
         .bind(username)
-        .bind(normalize_username(username))
+        .bind(username_normalized)
         .bind(password_hash)
+        .bind(permissions.upload_as_i64())
+        .bind(permissions.rename_as_i64())
+        .bind(permissions.delete_as_i64())
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    /// List all ordinary Users in display-name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SQLite` fails.
+    pub async fn list_users(&self) -> Result<Vec<ManagedUser>, AuthError> {
+        let rows = sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "SELECT username, can_upload, can_rename, can_delete FROM users WHERE is_admin = 0 \
+             ORDER BY username COLLATE NOCASE ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(username, can_upload, can_rename, can_delete)| ManagedUser {
+                    username,
+                    permissions: PermissionSet::from_database(can_upload, can_rename, can_delete),
+                },
+            )
+            .collect())
+    }
+
+    /// Update an ordinary User's Permission Set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the username is invalid, the target is Administrator, the user does not
+    /// exist, or `SQLite` fails.
+    pub async fn update_user_permissions(
+        &self,
+        username: &str,
+        permissions: PermissionSet,
+    ) -> Result<ManagedUser, AuthError> {
+        let username_normalized = ordinary_user_target(username)?;
+        let result = sqlx::query(
+            "UPDATE users SET can_upload = ?, can_rename = ?, can_delete = ? WHERE \
+             username_normalized = ? AND is_admin = 0",
+        )
+        .bind(permissions.upload_as_i64())
+        .bind(permissions.rename_as_i64())
+        .bind(permissions.delete_as_i64())
+        .bind(&username_normalized)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        self.managed_user(&username_normalized).await
+    }
+
+    /// Rename an ordinary User while preserving existing sessions and permissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either username is invalid, either target is Administrator, the new
+    /// username already exists, the user does not exist, or `SQLite` fails.
+    pub async fn rename_user(
+        &self,
+        username: &str,
+        new_username: &str,
+    ) -> Result<ManagedUser, AuthError> {
+        let username_normalized = ordinary_user_target(username)?;
+        let new_username_normalized = ordinary_user_target(new_username)?;
+        if username_normalized != new_username_normalized
+            && self.user_exists(&new_username_normalized).await?
+        {
+            return Err(AuthError::UsernameConflict);
+        }
+
+        let result = sqlx::query(
+            "UPDATE users SET username = ?, username_normalized = ? WHERE username_normalized = ? \
+             AND is_admin = 0",
+        )
+        .bind(new_username)
+        .bind(&new_username_normalized)
+        .bind(username_normalized)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+
+        self.managed_user(&new_username_normalized).await
+    }
+
+    /// Replace an ordinary User's Username, Password, and Permission Set.
+    ///
+    /// Existing sessions for the User are revoked because the password is replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target, replacement username, or password is invalid; the new
+    /// username already exists; the user does not exist; `SQLite` fails; or password hashing fails.
+    pub async fn replace_user(
+        &self,
+        username: &str,
+        new_username: &str,
+        password: &str,
+        permissions: PermissionSet,
+    ) -> Result<ManagedUser, AuthError> {
+        let username_normalized = ordinary_user_target(username)?;
+        let new_username_normalized = ordinary_user_target(new_username)?;
+        if !is_valid_password(password) {
+            return Err(AuthError::InvalidPassword);
+        }
+        if username_normalized != new_username_normalized
+            && self.user_exists(&new_username_normalized).await?
+        {
+            return Err(AuthError::UsernameConflict);
+        }
+
+        let Some((user_id,)) = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM users WHERE username_normalized = ? AND is_admin = 0",
+        )
+        .bind(&username_normalized)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Err(AuthError::UserNotFound);
+        };
+
+        let password_hash = hash_password(password.to_owned()).await?;
+        sqlx::query(
+            "UPDATE users SET username = ?, username_normalized = ?, password_hash = ?, \
+             can_upload = ?, can_rename = ?, can_delete = ? WHERE id = ?",
+        )
+        .bind(new_username)
+        .bind(&new_username_normalized)
+        .bind(password_hash)
+        .bind(permissions.upload_as_i64())
+        .bind(permissions.rename_as_i64())
+        .bind(permissions.delete_as_i64())
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+
+        self.managed_user(&new_username_normalized).await
+    }
+
+    /// Reset an ordinary User's Password and revoke that User's existing sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target or password is invalid, the user does not exist, `SQLite`
+    /// fails, or password hashing fails.
+    pub async fn reset_user_password(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<(), AuthError> {
+        let username_normalized = ordinary_user_target(username)?;
+        if !is_valid_password(password) {
+            return Err(AuthError::InvalidPassword);
+        }
+        let password_hash = hash_password(password.to_owned()).await?;
+        let Some((user_id,)) = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM users WHERE username_normalized = ? AND is_admin = 0",
+        )
+        .bind(&username_normalized)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Err(AuthError::UserNotFound);
+        };
+
+        sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+            .bind(password_hash)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete an ordinary User and revoke that User's existing sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target is invalid, the user does not exist, or `SQLite` fails.
+    pub async fn delete_user(&self, username: &str) -> Result<(), AuthError> {
+        let username_normalized = ordinary_user_target(username)?;
+        let Some((user_id,)) = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM users WHERE username_normalized = ? AND is_admin = 0",
+        )
+        .bind(&username_normalized)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Err(AuthError::UserNotFound);
+        };
+
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Return the Default Anonymous Permission Set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SQLite` fails.
+    pub async fn anonymous_permissions(&self) -> Result<PermissionSet, AuthError> {
+        let (can_upload, can_rename, can_delete) = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT can_upload, can_rename, can_delete FROM anonymous_permissions WHERE id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(PermissionSet::from_database(
+            can_upload, can_rename, can_delete,
+        ))
+    }
+
+    /// Update the Default Anonymous Permission Set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SQLite` fails.
+    pub async fn set_anonymous_permissions(
+        &self,
+        permissions: PermissionSet,
+    ) -> Result<PermissionSet, AuthError> {
+        sqlx::query(
+            "UPDATE anonymous_permissions SET can_upload = ?, can_rename = ?, can_delete = ? \
+             WHERE id = 1",
+        )
+        .bind(permissions.upload_as_i64())
+        .bind(permissions.rename_as_i64())
+        .bind(permissions.delete_as_i64())
+        .execute(&self.pool)
+        .await?;
+        Ok(permissions)
+    }
+
+    async fn user_exists(&self, username_normalized: &str) -> Result<bool, AuthError> {
+        let found =
+            sqlx::query_as::<_, (i64,)>("SELECT id FROM users WHERE username_normalized = ?")
+                .bind(username_normalized)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
+    }
+
+    async fn managed_user(&self, username_normalized: &str) -> Result<ManagedUser, AuthError> {
+        let Some((username, can_upload, can_rename, can_delete)) =
+            sqlx::query_as::<_, (String, i64, i64, i64)>(
+                "SELECT username, can_upload, can_rename, can_delete FROM users WHERE \
+                 username_normalized = ? AND is_admin = 0",
+            )
+            .bind(username_normalized)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Err(AuthError::UserNotFound);
+        };
+
+        Ok(ManagedUser {
+            username,
+            permissions: PermissionSet::from_database(can_upload, can_rename, can_delete),
+        })
     }
 
     async fn bootstrap_administrator(&self) -> Result<Option<BootstrapPassword>, AuthError> {
@@ -246,16 +567,25 @@ impl AuthState {
         }
 
         let token_hash = hash_session_token(session_token);
-        let identity = sqlx::query_as::<_, (String, i64)>(
-            "SELECT users.username, users.is_admin FROM sessions JOIN users ON users.id = \
-             sessions.user_id WHERE sessions.token_hash = ?",
+        let identity = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+            "SELECT users.username, users.is_admin, users.can_upload, users.can_rename, \
+             users.can_delete FROM sessions JOIN users ON users.id = sessions.user_id WHERE \
+             sessions.token_hash = ?",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
         .await?
-        .map(|(username, is_admin)| Identity {
-            username,
-            is_admin: is_admin != 0,
+        .map(|(username, is_admin, can_upload, can_rename, can_delete)| {
+            let is_admin = is_admin != 0;
+            Identity {
+                username,
+                is_admin,
+                permissions: if is_admin {
+                    PermissionSet::all_write()
+                } else {
+                    PermissionSet::from_database(can_upload, can_rename, can_delete)
+                },
+            }
         });
 
         Ok(identity)
@@ -390,6 +720,84 @@ impl Identity {
     pub const fn is_admin(&self) -> bool {
         self.is_admin
     }
+
+    /// Return this User's effective Permission Set.
+    #[must_use]
+    pub const fn permissions(&self) -> PermissionSet {
+        self.permissions
+    }
+}
+
+impl PermissionSet {
+    /// Build a Permission Set from independent write permissions.
+    #[must_use]
+    pub const fn new(upload: bool, rename: bool, delete: bool) -> Self {
+        Self {
+            upload,
+            rename,
+            delete,
+        }
+    }
+
+    /// Return a Permission Set with every write permission enabled.
+    #[must_use]
+    pub const fn all_write() -> Self {
+        Self::new(true, true, true)
+    }
+
+    /// Return whether upload actions are allowed.
+    #[must_use]
+    pub const fn upload(self) -> bool {
+        self.upload
+    }
+
+    /// Return whether rename actions are allowed.
+    #[must_use]
+    pub const fn rename(self) -> bool {
+        self.rename
+    }
+
+    /// Return whether delete actions are allowed.
+    #[must_use]
+    pub const fn delete(self) -> bool {
+        self.delete
+    }
+
+    const fn from_database(upload: i64, rename: i64, delete: i64) -> Self {
+        Self::new(upload != 0, rename != 0, delete != 0)
+    }
+
+    const fn upload_as_i64(self) -> i64 {
+        if self.upload { 1 } else { 0 }
+    }
+
+    const fn rename_as_i64(self) -> i64 {
+        if self.rename { 1 } else { 0 }
+    }
+
+    const fn delete_as_i64(self) -> i64 {
+        if self.delete { 1 } else { 0 }
+    }
+}
+
+impl Default for PermissionSet {
+    fn default() -> Self {
+        Self::new(false, false, false)
+    }
+}
+
+impl ManagedUser {
+    /// Return the User's display Username.
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Return the User's Permission Set.
+    #[must_use]
+    pub const fn permissions(&self) -> PermissionSet {
+        self.permissions
+    }
 }
 
 impl fmt::Debug for BootstrapPassword {
@@ -417,6 +825,25 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), AuthError> {
     .execute(pool)
     .await?;
 
+    add_user_column_if_missing(
+        pool,
+        "can_upload",
+        "ALTER TABLE users ADD COLUMN can_upload INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_user_column_if_missing(
+        pool,
+        "can_rename",
+        "ALTER TABLE users ADD COLUMN can_rename INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_user_column_if_missing(
+        pool,
+        "can_delete",
+        "ALTER TABLE users ADD COLUMN can_delete INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY,
@@ -426,6 +853,43 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), AuthError> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS anonymous_permissions (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            can_upload INTEGER NOT NULL DEFAULT 0,
+            can_rename INTEGER NOT NULL DEFAULT 0,
+            can_delete INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO anonymous_permissions (id, can_upload, can_rename, can_delete) \
+         VALUES (1, 0, 0, 0)",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn add_user_column_if_missing(
+    pool: &SqlitePool,
+    column: &str,
+    alter_statement: &'static str,
+) -> Result<(), AuthError> {
+    let exists = sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM pragma_table_info('users') WHERE name = ?",
+    )
+    .bind(column)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if exists {
+        return Ok(());
+    }
+
+    sqlx::query(alter_statement).execute(pool).await?;
     Ok(())
 }
 
@@ -504,6 +968,17 @@ fn is_valid_username(username: &str) -> bool {
 
 fn normalize_username(username: &str) -> String {
     username.to_ascii_lowercase()
+}
+
+fn ordinary_user_target(username: &str) -> Result<String, AuthError> {
+    if !is_valid_username(username) {
+        return Err(AuthError::InvalidUsername);
+    }
+    let normalized = normalize_username(username);
+    if normalized == ADMIN_USERNAME {
+        return Err(AuthError::ReservedAdministrator);
+    }
+    Ok(normalized)
 }
 
 fn is_valid_password(password: &str) -> bool {
