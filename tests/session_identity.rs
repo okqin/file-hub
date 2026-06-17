@@ -582,12 +582,12 @@ limits:
 }
 
 fn json_request(uri: &str, body: serde_json::Value) -> Result<Request<Body>> {
-    Ok(Request::builder()
+    Request::builder()
         .method("POST")
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
-        .context("build JSON request")?)
+        .context("build JSON request")
 }
 
 fn json_request_with_cookie(
@@ -596,22 +596,22 @@ fn json_request_with_cookie(
     body: serde_json::Value,
     session_cookie: &str,
 ) -> Result<Request<Body>> {
-    Ok(Request::builder()
+    Request::builder()
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, session_cookie)
         .body(Body::from(body.to_string()))
-        .context("build authenticated JSON request")?)
+        .context("build authenticated JSON request")
 }
 
 fn console_request(method: &str, uri: &str, session_cookie: &str) -> Result<Request<Body>> {
-    Ok(Request::builder()
+    Request::builder()
         .method(method)
         .uri(uri)
         .header(header::COOKIE, session_cookie)
         .body(Body::empty())
-        .context("build console request")?)
+        .context("build console request")
 }
 
 async fn response_json(response: axum::response::Response) -> Result<serde_json::Value> {
