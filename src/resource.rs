@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::fs;
+use tokio::{fs, fs::File};
 
 use crate::config::AppConfig;
 
@@ -107,6 +107,17 @@ pub enum ResourceKind {
     File,
 }
 
+/// File Resource download payload.
+#[derive(Debug)]
+pub struct FileDownload {
+    /// File Resource Name used as the suggested Download Name.
+    pub download_name: String,
+    /// File size in bytes.
+    pub content_length: u64,
+    /// Downloaded file content.
+    pub content: File,
+}
+
 /// Resource listing failure.
 #[derive(Debug, Error)]
 pub enum ResourceError {
@@ -119,6 +130,9 @@ pub enum ResourceError {
     /// The requested resource path is not a directory resource.
     #[error("resource path is not a directory")]
     NotDirectory,
+    /// The requested resource path is not a file resource.
+    #[error("resource path is not a file")]
+    NotFile,
     /// The requested resource path does not exist.
     #[error("resource path does not exist")]
     ResourceNotFound,
@@ -143,6 +157,9 @@ pub enum ResourceError {
     /// A resource's modified time could not be read.
     #[error("failed to read resource modified time")]
     ModifiedTime(#[source] std::io::Error),
+    /// A file resource's content could not be read.
+    #[error("failed to read file resource")]
+    ReadFile(#[source] std::io::Error),
 }
 
 /// List direct resources in the Root Directory.
@@ -245,6 +262,34 @@ pub async fn list_directory(
     })
 }
 
+/// Download a File Resource by Resource Path.
+///
+/// # Errors
+///
+/// Returns an error when the resource path is invalid, missing, outside the storage root, points
+/// at a Directory or symbolic link, or the file content cannot be opened.
+pub async fn download_file(config: &AppConfig, path: &str) -> Result<FileDownload, ResourceError> {
+    let resource_path = ResourcePath::parse(path)?;
+    if resource_path.as_str().is_empty() {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+    if resource_path.contains_reserved_name(config.staging_directory_name()) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+
+    let (file_path, content_length) =
+        resolve_file_path(config.storage_root(), &resource_path).await?;
+    let content = File::open(file_path)
+        .await
+        .map_err(ResourceError::ReadFile)?;
+
+    Ok(FileDownload {
+        download_name: resource_path.file_name()?,
+        content_length,
+        content,
+    })
+}
+
 #[derive(Debug)]
 struct ResourcePath<'a> {
     raw: &'a str,
@@ -308,6 +353,13 @@ impl<'a> ResourcePath<'a> {
     fn contains_reserved_name(&self, reserved_name: &str) -> bool {
         self.segments.contains(&reserved_name)
     }
+
+    fn file_name(&self) -> Result<String, ResourceError> {
+        self.segments
+            .last()
+            .map(|name| (*name).to_owned())
+            .ok_or(ResourceError::NotFile)
+    }
 }
 
 async fn resolve_directory_path(
@@ -331,6 +383,41 @@ async fn resolve_directory_path(
     }
 
     Ok(canonical)
+}
+
+async fn resolve_file_path(
+    storage_root: &std::path::Path,
+    resource_path: &ResourcePath<'_>,
+) -> Result<(PathBuf, u64), ResourceError> {
+    let Some((file_name, parent_segments)) = resource_path.segments.split_last() else {
+        return Err(ResourceError::NotFile);
+    };
+
+    let mut path = storage_root.to_path_buf();
+    for segment in parent_segments {
+        path.push(segment);
+        let metadata = fs::symlink_metadata(&path)
+            .await
+            .map_err(map_resolve_error)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(ResourceError::NotDirectory);
+        }
+    }
+
+    path.push(file_name);
+    let metadata = fs::symlink_metadata(&path)
+        .await
+        .map_err(map_resolve_error)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ResourceError::NotFile);
+    }
+
+    let canonical = fs::canonicalize(path).await.map_err(map_resolve_error)?;
+    if !canonical.starts_with(storage_root) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+
+    Ok((canonical, metadata.len()))
 }
 
 fn map_resolve_error(error: std::io::Error) -> ResourceError {

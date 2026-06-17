@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
 };
 use file_hub::{config::AppConfig, http::build_router};
 use filetime::{FileTime, set_file_mtime};
@@ -27,6 +27,176 @@ async fn test_should_list_root_directory_for_anonymous_http_request() -> Result<
     let names = resource_names(&body)?;
 
     assert_eq!(names, vec!["docs", "readme.txt"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_download_file_resource_for_anonymous_http_request() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(
+        storage_root.path().join("readme.txt"),
+        b"hello from storage root",
+    )
+    .await
+    .context("write downloadable file")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, "readme.txt").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_DISPOSITION),
+        Some(&header::HeaderValue::from_static(
+            "attachment; filename=\"readme.txt\"; filename*=UTF-8''readme.txt",
+        )),
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static(
+            "application/octet-stream"
+        )),
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_LENGTH),
+        Some(&header::HeaderValue::from_static("23")),
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read download response body")?;
+    assert_eq!(body.as_ref(), b"hello from storage root");
+    let storage_root_text = storage_root.path().to_string_lossy();
+    assert!(!String::from_utf8_lossy(&body).contains(storage_root_text.as_ref()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_escape_download_name_in_content_disposition() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(
+        storage_root.path().join("report \"final\".txt"),
+        b"quoted download",
+    )
+    .await
+    .context("write file with quoted resource name")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, "report%20%22final%22.txt").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_DISPOSITION),
+        Some(&header::HeaderValue::from_static(
+            "attachment; filename=\"report \\\"final\\\".txt\"; \
+             filename*=UTF-8''report%20%22final%22.txt",
+        )),
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read quoted download response body")?;
+    assert_eq!(body.as_ref(), b"quoted download");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_download_without_resource_path() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download_without_path(app).await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_empty_download_resource_path() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, "").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_directory_resource_path_for_download() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join("docs"))
+        .await
+        .context("create docs directory")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, "docs").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "not_file").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_return_not_found_for_missing_download_resource_path() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, "missing.txt").await?;
+
+    assert_error(response, StatusCode::NOT_FOUND, "resource_not_found").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_download_path_traversal_and_absolute_resource_paths() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+
+    let traversal = request_download(app.clone(), "..").await?;
+    assert_error(traversal, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+
+    let absolute = request_download(app, "%2Ftmp").await?;
+    assert_error(absolute, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_reject_symlink_file_resource_download() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    fs::write(outside.path().join("secret.txt"), b"secret")
+        .await
+        .context("write outside file")?;
+    tokio::fs::symlink(
+        outside.path().join("secret.txt"),
+        storage_root.path().join("secret-link.txt"),
+    )
+    .await
+    .context("create symlink file")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, "secret-link.txt").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "not_file").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_download_from_reserved_staging_directory() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join(".fh-staging"))
+        .await
+        .context("create reserved staging directory")?;
+    fs::write(
+        storage_root.path().join(".fh-staging").join("internal.txt"),
+        b"internal",
+    )
+    .await
+    .context("write staging internal file")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, ".fh-staging/internal.txt").await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_resource_path").await?;
     Ok(())
 }
 
@@ -475,6 +645,33 @@ async fn test_should_render_browser_controls_for_navigation_sort_and_current_fil
     Ok(())
 }
 
+#[tokio::test]
+async fn test_should_render_browser_file_resource_open_as_download_flow() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .context("build browser request")?,
+        )
+        .await
+        .context("send browser request")?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read browser response body")?;
+    let body = String::from_utf8(body.to_vec()).context("browser body must be UTF-8")?;
+
+    assert!(body.contains("function downloadResource(resourcePath)"));
+    assert!(body.contains("'/api/download?path=' + encodeURIComponent(resourcePath)"));
+    assert!(body.contains("downloadResource(resource.resourcePath)"));
+    Ok(())
+}
+
 async fn app_from_storage_root(
     storage_root: &Path,
     listing_limit: usize,
@@ -620,6 +817,28 @@ async fn request_listing(
     )
     .await
     .context("send list request")
+}
+
+async fn request_download(app: axum::Router, path: &str) -> Result<axum::response::Response> {
+    app.oneshot(
+        Request::builder()
+            .uri(format!("/api/download?path={path}"))
+            .body(Body::empty())
+            .context("build download request")?,
+    )
+    .await
+    .context("send download request")
+}
+
+async fn request_download_without_path(app: axum::Router) -> Result<axum::response::Response> {
+    app.oneshot(
+        Request::builder()
+            .uri("/api/download")
+            .body(Body::empty())
+            .context("build download request")?,
+    )
+    .await
+    .context("send download request")
 }
 
 async fn assert_error(
