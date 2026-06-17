@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
@@ -32,6 +33,7 @@ pub fn build_router(config: AppConfig) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/list", get(list_root_directory))
+        .route("/api/download", get(download_file))
         .with_state(state)
         .layer(ServiceBuilder::new().layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -51,6 +53,12 @@ struct ListQuery {
     sort: Option<resource::SortField>,
     order: Option<resource::SortOrder>,
     filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DownloadQuery {
+    path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +102,31 @@ async fn list_root_directory(
         .map_err(ApiError::from)
 }
 
+async fn download_file(
+    State(state): State<AppState>,
+    Query(query): Query<DownloadQuery>,
+) -> Result<Response, ApiError> {
+    let path = query
+        .path
+        .as_deref()
+        .ok_or(resource::ResourceError::InvalidResourcePath)?;
+    let download = resource::download_file(&state.config, path).await?;
+    let content_length = download.content.len().to_string();
+    let content_disposition = content_disposition_header(&download.download_name)?;
+    let content_length =
+        HeaderValue::from_str(&content_length).map_err(|_| ApiError::internal_server_error())?;
+
+    let mut response = Body::from(download.content).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(header::CONTENT_DISPOSITION, content_disposition);
+    headers.insert(header::CONTENT_LENGTH, content_length);
+    Ok(response)
+}
+
 impl From<resource::ResourceError> for ApiError {
     fn from(error: resource::ResourceError) -> Self {
         match error {
@@ -111,6 +144,11 @@ impl From<resource::ResourceError> for ApiError {
                 status: StatusCode::BAD_REQUEST,
                 code: "not_directory",
                 reason: "resource path is not a directory".to_owned(),
+            },
+            resource::ResourceError::NotFile => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "not_file",
+                reason: "resource path is not a file".to_owned(),
             },
             resource::ResourceError::ResourceNotFound => Self {
                 status: StatusCode::NOT_FOUND,
@@ -130,11 +168,22 @@ impl From<resource::ResourceError> for ApiError {
             resource::ResourceError::ReadDirectory(_)
             | resource::ResourceError::ReadEntry(_)
             | resource::ResourceError::Metadata(_)
-            | resource::ResourceError::ModifiedTime(_) => Self {
+            | resource::ResourceError::ModifiedTime(_)
+            | resource::ResourceError::ReadFile(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "resource_listing_failed",
-                reason: "failed to list Directory".to_owned(),
+                reason: "failed to read Resource".to_owned(),
             },
+        }
+    }
+}
+
+impl ApiError {
+    fn internal_server_error() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_server_error",
+            reason: "internal server error".to_owned(),
         }
     }
 }
@@ -151,6 +200,48 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+fn content_disposition_header(download_name: &str) -> Result<HeaderValue, ApiError> {
+    let value = format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        quoted_filename(download_name),
+        percent_encode_filename(download_name),
+    );
+    HeaderValue::from_str(&value).map_err(|_| ApiError::internal_server_error())
+}
+
+fn quoted_filename(download_name: &str) -> String {
+    let mut quoted = String::with_capacity(download_name.len());
+    for character in download_name.chars() {
+        if character == '"' || character == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted
+}
+
+fn percent_encode_filename(download_name: &str) -> String {
+    let mut encoded = String::with_capacity(download_name.len());
+    for byte in download_name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(upper_hex_digit(byte >> 4));
+            encoded.push(upper_hex_digit(byte & 0x0F));
+        }
+    }
+    encoded
+}
+
+fn upper_hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'A' + (value - 10)),
+        _ => '%',
     }
 }
 
@@ -391,6 +482,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
         returnToParent.hidden = false;
       }
 
+      function downloadResource(resourcePath) {
+        window.location.assign('/api/download?path=' + encodeURIComponent(resourcePath));
+      }
+
       function renderSort(sort) {
         state.sort = sort.field || state.sort;
         state.order = sort.order || state.order;
@@ -426,7 +521,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
             });
             name.appendChild(open);
           } else {
-            name.appendChild(text(resource.name));
+            var download = document.createElement('button');
+            download.type = 'button';
+            download.appendChild(text(resource.name));
+            download.addEventListener('click', function () {
+              downloadResource(resource.resourcePath);
+            });
+            name.appendChild(download);
           }
           var kind = document.createElement('td');
           kind.appendChild(text(resource.kind));
