@@ -577,6 +577,278 @@ async fn test_should_filter_current_directory_only_while_preserving_sort() -> Re
 }
 
 #[tokio::test]
+async fn test_should_reject_server_search_query_shorter_than_two_non_whitespace_characters()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_search(app.clone(), "q=%20a%20").await?;
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_search_query").await?;
+
+    let response = request_search(app, "q=%E5%AD%97").await?;
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_search_query").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_server_search_query_over_configured_length() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let long_query = "a".repeat(257);
+    let response = request_search(app, &format!("q={long_query}")).await?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_search_query").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_return_flat_nested_server_search_results_with_containing_paths() -> Result<()>
+{
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir_all(storage_root.path().join("alpha").join("nested"))
+        .await
+        .context("create alpha nested directory")?;
+    fs::create_dir(storage_root.path().join("beta"))
+        .await
+        .context("create beta directory")?;
+    fs::write(
+        storage_root.path().join("alpha").join("Report.txt"),
+        b"alpha",
+    )
+    .await
+    .context("write alpha report")?;
+    fs::write(
+        storage_root
+            .path()
+            .join("alpha")
+            .join("nested")
+            .join("report.txt"),
+        b"nested",
+    )
+    .await
+    .context("write nested report")?;
+    fs::write(storage_root.path().join("beta").join("REPORT.txt"), b"beta")
+        .await
+        .context("write beta report")?;
+    fs::write(storage_root.path().join("report-notes.txt"), b"root")
+        .await
+        .context("write root report")?;
+
+    let app = app_from_storage_root(storage_root.path(), 20, "UTC").await?;
+    let body = get_search(app, "q=report").await?;
+    let resources = search_resources(&body)?;
+
+    assert_eq!(
+        resources,
+        vec![
+            ("Report.txt", "alpha/Report.txt", "alpha"),
+            ("report.txt", "alpha/nested/report.txt", "alpha/nested"),
+            ("REPORT.txt", "beta/REPORT.txt", "beta"),
+            ("report-notes.txt", "report-notes.txt", ""),
+        ],
+    );
+    assert_eq!(body.get("truncated"), Some(&Value::Bool(false)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_disambiguate_same_named_server_search_results_with_containing_paths()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join("alpha"))
+        .await
+        .context("create alpha directory")?;
+    fs::create_dir(storage_root.path().join("beta"))
+        .await
+        .context("create beta directory")?;
+    fs::write(
+        storage_root.path().join("alpha").join("report.txt"),
+        b"alpha",
+    )
+    .await
+    .context("write alpha report")?;
+    fs::write(storage_root.path().join("beta").join("report.txt"), b"beta")
+        .await
+        .context("write beta report")?;
+
+    let app = app_from_storage_root(storage_root.path(), 20, "UTC").await?;
+    let body = get_search(app, "q=report").await?;
+
+    assert_eq!(
+        search_resources(&body)?,
+        vec![
+            ("report.txt", "alpha/report.txt", "alpha"),
+            ("report.txt", "beta/report.txt", "beta"),
+        ],
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_match_server_search_as_plain_resource_name_substring_only() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(storage_root.path().join("literal-star-*.txt"), b"plain")
+        .await
+        .context("write literal wildcard resource")?;
+    fs::write(storage_root.path().join("report.txt"), b"literal-star")
+        .await
+        .context("write content-only match")?;
+
+    let app = app_from_storage_root(storage_root.path(), 20, "UTC").await?;
+    let wildcard_body = get_search(app.clone(), "q=star-*").await?;
+    assert_eq!(
+        search_resources(&wildcard_body)?,
+        vec![("literal-star-*.txt", "literal-star-*.txt", "")],
+    );
+
+    let content_body = get_search(app, "q=plain").await?;
+    assert!(search_resources(&content_body)?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_report_truncated_server_search_when_result_limit_is_reached() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(storage_root.path().join("match-a.txt"), b"a")
+        .await
+        .context("write first match")?;
+    fs::write(storage_root.path().join("match-b.txt"), b"b")
+        .await
+        .context("write second match")?;
+    fs::write(storage_root.path().join("match-c.txt"), b"c")
+        .await
+        .context("write third match")?;
+
+    let app =
+        app_from_storage_root_with_search_limits(storage_root.path(), 10, 2, 100, "UTC").await?;
+    let body = get_search(app, "q=match").await?;
+    let resources = search_resources(&body)?;
+
+    assert_eq!(
+        resources,
+        vec![
+            ("match-a.txt", "match-a.txt", ""),
+            ("match-b.txt", "match-b.txt", ""),
+        ],
+    );
+    assert_eq!(body.get("truncated"), Some(&Value::Bool(true)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_report_truncated_server_search_when_traversal_limit_is_reached() -> Result<()>
+{
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(storage_root.path().join("target-a.txt"), b"a")
+        .await
+        .context("write first target")?;
+    fs::write(storage_root.path().join("target-b.txt"), b"b")
+        .await
+        .context("write second target")?;
+
+    let app =
+        app_from_storage_root_with_search_limits(storage_root.path(), 10, 10, 1, "UTC").await?;
+    let body = get_search(app, "q=target").await?;
+    let resources = search_resources(&body)?;
+
+    assert_eq!(resources, vec![("target-a.txt", "target-a.txt", "")]);
+    assert_eq!(body.get("truncated"), Some(&Value::Bool(true)));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_exclude_reserved_staging_names_and_symlinks_from_server_search() -> Result<()>
+{
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    fs::write(storage_root.path().join("visible-target.txt"), b"visible")
+        .await
+        .context("write visible target")?;
+    fs::create_dir(storage_root.path().join(".fh-staging"))
+        .await
+        .context("create reserved staging directory")?;
+    fs::write(
+        storage_root
+            .path()
+            .join(".fh-staging")
+            .join("hidden-target.txt"),
+        b"hidden",
+    )
+    .await
+    .context("write hidden staging target")?;
+    fs::write(outside.path().join("secret-target.txt"), b"secret")
+        .await
+        .context("write outside target")?;
+    tokio::fs::symlink(
+        outside.path().join("secret-target.txt"),
+        storage_root.path().join("linked-target.txt"),
+    )
+    .await
+    .context("create symlink target")?;
+
+    let app = app_from_storage_root(storage_root.path(), 20, "UTC").await?;
+    let body = get_search(app, "q=target").await?;
+    let resources = search_resources(&body)?;
+
+    assert_eq!(
+        resources,
+        vec![("visible-target.txt", "visible-target.txt", "")]
+    );
+    assert_eq!(body.get("truncated"), Some(&Value::Bool(false)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_use_search_result_paths_for_file_download_directory_open_and_containing_path_navigation()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir_all(storage_root.path().join("docs").join("matches-dir"))
+        .await
+        .context("create matching directory")?;
+    fs::write(
+        storage_root
+            .path()
+            .join("docs")
+            .join("matches-dir")
+            .join("inside.txt"),
+        b"inside",
+    )
+    .await
+    .context("write file inside matching directory")?;
+    fs::write(
+        storage_root.path().join("docs").join("matches-file.txt"),
+        b"download",
+    )
+    .await
+    .context("write matching file")?;
+
+    let app = app_from_storage_root(storage_root.path(), 20, "UTC").await?;
+    let body = get_search(app.clone(), "q=matches").await?;
+    let file_path = search_resource_path(&body, "matches-file.txt")?;
+    let directory_path = search_resource_path(&body, "matches-dir")?;
+    let containing_path = search_containing_path(&body, "matches-file.txt")?;
+
+    let download = request_download(app.clone(), file_path).await?;
+    assert_eq!(download.status(), StatusCode::OK);
+    let download_body = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .context("read search result file download")?;
+    assert_eq!(download_body.as_ref(), b"download");
+
+    let opened_directory = get_listing(app.clone(), Some(directory_path)).await?;
+    assert_eq!(resource_names(&opened_directory)?, vec!["inside.txt"]);
+
+    let containing_directory = get_listing(app, Some(containing_path)).await?;
+    assert_eq!(
+        resource_names(&containing_directory)?,
+        vec!["matches-dir", "matches-file.txt"],
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_should_reject_path_traversal_and_absolute_resource_paths() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
 
@@ -781,6 +1053,10 @@ server:
   time_zone: "Not/AZone"
 limits:
   listing_direct_child_limit: 10
+  archive_resource_count_limit: 100
+  archive_uncompressed_size_limit_bytes: 1048576
+  search_result_limit: 100
+  search_traversal_limit: 1000
   request_timeout_seconds: 5
   fs_concurrency_limit: 4
 "#,
@@ -914,6 +1190,43 @@ async fn test_should_render_browser_directory_archive_action_separate_from_direc
     Ok(())
 }
 
+#[tokio::test]
+async fn test_should_render_browser_server_search_mode_switching_and_result_actions() -> Result<()>
+{
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .context("build browser request")?,
+        )
+        .await
+        .context("send browser request")?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read browser response body")?;
+    let body = String::from_utf8(body.to_vec()).context("browser body must be UTF-8")?;
+
+    assert!(body.contains("id=\"search-mode\""));
+    assert!(body.contains("value=\"currentListFilter\" selected"));
+    assert!(body.contains("value=\"serverSearch\""));
+    assert!(body.contains("id=\"server-search-submit\""));
+    assert!(body.contains("serverSearchSubmit.hidden = state.searchMode !== 'serverSearch'"));
+    assert!(body.contains("function runServerSearch()"));
+    assert!(body.contains("fetch('/api/search?q=' + encodeURIComponent(state.filter))"));
+    assert!(body.contains("function renderSearchRows(rows, truncated)"));
+    assert!(body.contains("loadDirectory(row.containingPath)"));
+    assert!(body.contains("downloadResource(row.resource.resourcePath)"));
+    assert!(body.contains("loadDirectory(row.resource.resourcePath)"));
+    assert!(body.contains("Search results truncated"));
+    Ok(())
+}
+
 async fn app_from_storage_root(
     storage_root: &Path,
     listing_limit: usize,
@@ -949,6 +1262,45 @@ limits:
   listing_direct_child_limit: {listing_limit}
   archive_resource_count_limit: {archive_resource_count_limit}
   archive_uncompressed_size_limit_bytes: {archive_uncompressed_size_limit_bytes}
+  search_result_limit: 100
+  search_traversal_limit: 1000
+  request_timeout_seconds: 5
+  fs_concurrency_limit: 4
+"#,
+        storage_root = storage_root.to_string_lossy(),
+    );
+    fs::write(&config_path, config)
+        .await
+        .context("write temporary config file")?;
+
+    let config = AppConfig::load_from_path(&config_path)
+        .await
+        .context("load app config")?;
+    Ok(build_router(config))
+}
+
+async fn app_from_storage_root_with_search_limits(
+    storage_root: &Path,
+    listing_limit: usize,
+    search_result_limit: usize,
+    search_traversal_limit: usize,
+    time_zone: &str,
+) -> Result<axum::Router> {
+    let config_dir = TempDir::new().context("create temporary config directory")?;
+    let config_path = config_dir.path().join("file-hub.yaml");
+    let config = format!(
+        r#"
+storage_root: {storage_root:?}
+staging_directory_name: ".fh-staging"
+server:
+  bind_address: "127.0.0.1:0"
+  time_zone: "{time_zone}"
+limits:
+  listing_direct_child_limit: {listing_limit}
+  archive_resource_count_limit: 100
+  archive_uncompressed_size_limit_bytes: 1048576
+  search_result_limit: {search_result_limit}
+  search_traversal_limit: {search_traversal_limit}
   request_timeout_seconds: 5
   fs_concurrency_limit: 4
 "#,
@@ -1043,6 +1395,75 @@ async fn get_listing_with_query(app: axum::Router, query: &str) -> Result<Value>
     serde_json::from_slice(&body).context("parse list response body")
 }
 
+async fn get_search(app: axum::Router, query: &str) -> Result<Value> {
+    let response = request_search(app, query).await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read search response body")?;
+    serde_json::from_slice(&body).context("parse search response body")
+}
+
+fn search_resources(body: &Value) -> Result<Vec<(&str, &str, &str)>> {
+    let resources = body
+        .get("resources")
+        .and_then(Value::as_array)
+        .context("search resources must be an array")?;
+
+    resources
+        .iter()
+        .map(|row| {
+            let resource = row.get("resource").context("search row resource exists")?;
+            let name = resource
+                .get("name")
+                .and_then(Value::as_str)
+                .context("search resource name must be a string")?;
+            let resource_path = resource
+                .get("resourcePath")
+                .and_then(Value::as_str)
+                .context("search resource path must be a string")?;
+            let containing_path = row
+                .get("containingPath")
+                .and_then(Value::as_str)
+                .context("search containing path must be a string")?;
+            Ok((name, resource_path, containing_path))
+        })
+        .collect()
+}
+
+fn search_resource_path<'a>(body: &'a Value, name: &str) -> Result<&'a str> {
+    let row = search_row_named(body, name)?;
+    row.get("resource")
+        .and_then(|resource| resource.get("resourcePath"))
+        .and_then(Value::as_str)
+        .with_context(|| format!("search resource path for {name} must be a string"))
+}
+
+fn search_containing_path<'a>(body: &'a Value, name: &str) -> Result<&'a str> {
+    search_row_named(body, name)?
+        .get("containingPath")
+        .and_then(Value::as_str)
+        .with_context(|| format!("search containing path for {name} must be a string"))
+}
+
+fn search_row_named<'a>(body: &'a Value, name: &str) -> Result<&'a Value> {
+    let resources = body
+        .get("resources")
+        .and_then(Value::as_array)
+        .context("search resources must be an array")?;
+    resources
+        .iter()
+        .find(|row| {
+            row.get("resource")
+                .and_then(|resource| resource.get("name"))
+                .and_then(Value::as_str)
+                == Some(name)
+        })
+        .with_context(|| format!("search result {name} must exist"))
+}
+
 async fn request_listing_with_query(
     app: axum::Router,
     query: &str,
@@ -1111,6 +1532,17 @@ async fn request_archive(app: axum::Router, path: &str) -> Result<axum::response
     )
     .await
     .context("send archive request")
+}
+
+async fn request_search(app: axum::Router, query: &str) -> Result<axum::response::Response> {
+    app.oneshot(
+        Request::builder()
+            .uri(format!("/api/search?{query}"))
+            .body(Body::empty())
+            .context("build search request")?,
+    )
+    .await
+    .context("send search request")
 }
 
 fn zip_entry_names(bytes: &[u8]) -> Result<Vec<String>> {

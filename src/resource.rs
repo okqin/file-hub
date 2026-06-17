@@ -15,6 +15,8 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::config::AppConfig;
 
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
+
 /// Root directory listing response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +145,9 @@ pub enum ResourceError {
     /// The Current List Filter query is invalid.
     #[error("current list filter query is invalid")]
     InvalidFilter,
+    /// The Server Search query is invalid.
+    #[error("server search query is invalid")]
+    InvalidSearchQuery,
     /// The requested resource path is not a directory resource.
     #[error("resource path is not a directory")]
     NotDirectory,
@@ -364,6 +369,136 @@ pub async fn download_directory_archive(
         content_length,
         content,
     })
+}
+
+/// Search Resources by Resource Name across the Resource tree.
+///
+/// # Errors
+///
+/// Returns an error when the query is shorter than two non-whitespace characters or exceeds the
+/// maximum query length.
+pub async fn search_resources(
+    config: &AppConfig,
+    query: &str,
+) -> Result<SearchResults, ResourceError> {
+    validate_search_query(query)?;
+    let query = query.trim();
+    let query_lowercase = query.to_lowercase();
+    let mut resources = Vec::new();
+    let mut pending_directories = vec![(config.storage_root().to_path_buf(), String::new())];
+    let result_limit = config.limits().search_result_limit().get();
+    let traversal_limit = config.limits().search_traversal_limit().get();
+    let mut traversed_resources = 0usize;
+    let mut truncated = false;
+
+    while let Some((current_directory, containing_path)) = pending_directories.pop() {
+        let mut read_dir = fs::read_dir(&current_directory)
+            .await
+            .map_err(ResourceError::ReadDirectory)?;
+        let mut entries = Vec::new();
+
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(ResourceError::ReadEntry)?
+        {
+            entries.push(entry);
+        }
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            if traversed_resources == traversal_limit {
+                truncated = true;
+                pending_directories.clear();
+                break;
+            }
+            traversed_resources += 1;
+
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ResourceError::InvalidResourceName)?;
+            if name == config.staging_directory_name() {
+                continue;
+            }
+
+            let metadata = fs::symlink_metadata(entry.path())
+                .await
+                .map_err(ResourceError::Metadata)?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let kind = if file_type.is_dir() {
+                ResourceKind::Directory
+            } else if file_type.is_file() {
+                ResourceKind::File
+            } else {
+                continue;
+            };
+            let resource_path = join_resource_path(&containing_path, &name);
+
+            if name.to_lowercase().contains(&query_lowercase) {
+                if resources.len() == result_limit {
+                    truncated = true;
+                    pending_directories.clear();
+                    break;
+                }
+
+                resources.push(SearchResultRow {
+                    resource: ResourceRow {
+                        resource_path: resource_path.clone(),
+                        name: name.clone(),
+                        kind,
+                        size: (kind == ResourceKind::File).then_some(metadata.len()),
+                        modified_time: format_modified_time(
+                            metadata.modified().map_err(ResourceError::ModifiedTime)?,
+                            config.server().time_zone(),
+                        ),
+                    },
+                    containing_path: containing_path.clone(),
+                });
+            }
+
+            if kind == ResourceKind::Directory {
+                pending_directories.push((entry.path(), resource_path));
+            }
+        }
+    }
+
+    resources.sort_by(|left, right| {
+        left.resource
+            .resource_path
+            .cmp(&right.resource.resource_path)
+    });
+    Ok(SearchResults {
+        query: query.to_owned(),
+        truncated,
+        resources,
+    })
+}
+
+/// Server Search response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResults {
+    /// Validated Server Search query.
+    pub query: String,
+    /// Whether the configured limits prevented a complete result set.
+    pub truncated: bool,
+    /// Flat Search Results.
+    pub resources: Vec<SearchResultRow>,
+}
+
+/// A flat Server Search result row.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResultRow {
+    /// Matched Resource.
+    pub resource: ResourceRow,
+    /// Containing Resource Path.
+    pub containing_path: String,
 }
 
 #[derive(Debug)]
@@ -630,6 +765,27 @@ fn map_resolve_error(error: std::io::Error) -> ResourceError {
         ResourceError::ResourceNotFound
     } else {
         ResourceError::ReadDirectory(error)
+    }
+}
+
+fn validate_search_query(query: &str) -> Result<(), ResourceError> {
+    let non_whitespace_characters = query
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .take(2)
+        .count();
+    if non_whitespace_characters < 2 || query.len() > MAX_SEARCH_QUERY_BYTES {
+        return Err(ResourceError::InvalidSearchQuery);
+    }
+
+    Ok(())
+}
+
+fn join_resource_path(containing_path: &str, name: &str) -> String {
+    if containing_path.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{containing_path}/{name}")
     }
 }
 

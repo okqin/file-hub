@@ -34,6 +34,7 @@ pub fn build_router(config: AppConfig) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/list", get(list_root_directory))
+        .route("/api/search", get(search_resources))
         .route("/api/download", get(download_file))
         .route("/api/archive", get(download_directory_archive))
         .with_state(state)
@@ -61,6 +62,12 @@ struct ListQuery {
 #[serde(deny_unknown_fields)]
 struct DownloadQuery {
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchQuery {
+    q: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,6 +136,20 @@ async fn download_file(
     Ok(response)
 }
 
+async fn search_resources(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<resource::SearchResults>, ApiError> {
+    let query = query
+        .q
+        .as_deref()
+        .ok_or(resource::ResourceError::InvalidSearchQuery)?;
+    resource::search_resources(&state.config, query)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
 async fn download_directory_archive(
     State(state): State<AppState>,
     Query(query): Query<DownloadQuery>,
@@ -165,6 +186,11 @@ impl From<resource::ResourceError> for ApiError {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_filter",
                 reason: "current list filter query is invalid".to_owned(),
+            },
+            resource::ResourceError::InvalidSearchQuery => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_search_query",
+                reason: "server search query is invalid".to_owned(),
             },
             resource::ResourceError::NotDirectory => Self {
                 status: StatusCode::BAD_REQUEST,
@@ -374,12 +400,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-size: 14px;
       font-weight: 600;
     }
-    input {
+    input,
+    select {
       min-width: 260px;
       padding: 8px 10px;
       border: 1px solid #d8dee4;
       border-radius: 6px;
       font: inherit;
+    }
+    select {
+      min-width: 180px;
     }
     button {
       padding: 0;
@@ -429,8 +459,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="toolbar">
       <button type="button" id="return-to-parent" class="parent" hidden>Return to parent</button>
       <div class="filter">
-        <label for="current-list-filter">Current List Filter</label>
+        <label for="search-mode">Search Mode</label>
+        <select id="search-mode">
+          <option value="currentListFilter" selected>Current List Filter</option>
+          <option value="serverSearch">Server Search</option>
+        </select>
+        <label for="current-list-filter">Search</label>
         <input id="current-list-filter" type="search" autocomplete="off">
+        <button type="button" id="server-search-submit" hidden>Search</button>
       </div>
     </div>
     <section aria-label="Root Directory">
@@ -455,14 +491,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
       var resources = document.getElementById('resources');
       var breadcrumb = document.getElementById('breadcrumb');
       var returnToParent = document.getElementById('return-to-parent');
+      var searchMode = document.getElementById('search-mode');
       var filter = document.getElementById('current-list-filter');
+      var serverSearchSubmit = document.getElementById('server-search-submit');
       var sortButtons = Array.prototype.slice.call(document.querySelectorAll('[data-sort-field]'));
       var sortIndicators = Array.prototype.slice.call(document.querySelectorAll('[data-sort-indicator]'));
       var state = {
         path: '',
         sort: 'name',
         order: 'asc',
-        filter: ''
+        filter: '',
+        searchMode: 'currentListFilter'
       };
 
       function text(value) {
@@ -499,6 +538,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             state.path = body.path || '';
             renderBreadcrumb(body.breadcrumbs || []);
             renderParentAction();
+            renderSearchMode();
             renderSort(body.sort || { field: state.sort, order: state.order });
             renderRows(body.resources || []);
           })
@@ -540,12 +580,110 @@ const INDEX_HTML: &str = r#"<!doctype html>
         window.location.assign('/api/archive?path=' + encodeURIComponent(resourcePath));
       }
 
+      function renderSearchMode() {
+        serverSearchSubmit.hidden = state.searchMode !== 'serverSearch';
+      }
+
+      function runServerSearch() {
+        fetch('/api/search?q=' + encodeURIComponent(state.filter))
+          .then(function (response) {
+            return response.json().then(function (body) {
+              if (!response.ok) {
+                throw new Error(body.error && body.error.reason ? body.error.reason : 'Search failed');
+              }
+              return body;
+            });
+          })
+          .then(function (body) {
+            renderSearchRows(body.resources || [], Boolean(body.truncated));
+          })
+          .catch(function (error) {
+            renderError(error.message);
+          });
+      }
+
       function renderSort(sort) {
         state.sort = sort.field || state.sort;
         state.order = sort.order || state.order;
         sortIndicators.forEach(function (indicator) {
           var field = indicator.getAttribute('data-sort-indicator');
           indicator.textContent = field === state.sort ? state.order : '';
+        });
+      }
+
+      function renderSearchRows(rows, truncated) {
+        resources.textContent = '';
+        if (truncated) {
+          var truncatedRow = document.createElement('tr');
+          var truncatedCell = document.createElement('td');
+          truncatedCell.colSpan = 5;
+          truncatedCell.className = 'muted';
+          truncatedCell.appendChild(text('Search results truncated'));
+          truncatedRow.appendChild(truncatedCell);
+          resources.appendChild(truncatedRow);
+        }
+        if (!rows.length) {
+          var emptyRow = document.createElement('tr');
+          var emptyCell = document.createElement('td');
+          emptyCell.colSpan = 5;
+          emptyCell.className = 'muted';
+          emptyCell.appendChild(text('Empty'));
+          emptyRow.appendChild(emptyCell);
+          resources.appendChild(emptyRow);
+          return;
+        }
+
+        rows.forEach(function (row) {
+          var resource = row.resource;
+          var resultRow = document.createElement('tr');
+          var name = document.createElement('td');
+          name.className = 'name';
+          if (resource.kind === 'directory') {
+            var open = document.createElement('button');
+            open.type = 'button';
+            open.appendChild(text(resource.name));
+            open.addEventListener('click', function () {
+              loadDirectory(row.resource.resourcePath);
+            });
+            name.appendChild(open);
+          } else {
+            var download = document.createElement('button');
+            download.type = 'button';
+            download.appendChild(text(resource.name));
+            download.addEventListener('click', function () {
+              downloadResource(row.resource.resourcePath);
+            });
+            name.appendChild(download);
+          }
+          var kind = document.createElement('td');
+          kind.appendChild(text(resource.kind));
+          var size = document.createElement('td');
+          size.appendChild(text(resource.size));
+          var containingPath = document.createElement('td');
+          var containingPathButton = document.createElement('button');
+          containingPathButton.type = 'button';
+          containingPathButton.appendChild(text(row.containingPath || 'Root Directory'));
+          containingPathButton.addEventListener('click', function () {
+            loadDirectory(row.containingPath);
+          });
+          containingPath.appendChild(containingPathButton);
+          var actions = document.createElement('td');
+          if (resource.kind === 'directory') {
+            var archive = document.createElement('button');
+            archive.type = 'button';
+            archive.setAttribute('aria-label', 'Download archive for ' + resource.name);
+            archive.appendChild(text('Download archive'));
+            archive.addEventListener('click', function () {
+              downloadDirectoryArchive(row.resource.resourcePath);
+            });
+            actions.appendChild(archive);
+          }
+          resultRow.appendChild(name);
+          resultRow.appendChild(kind);
+          resultRow.appendChild(size);
+          resultRow.appendChild(containingPath);
+          resultRow.appendChild(actions);
+          resources.appendChild(resultRow);
         });
       }
 
@@ -624,9 +762,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
         loadDirectory(parentPath(state.path));
       });
 
+      searchMode.addEventListener('change', function () {
+        state.searchMode = searchMode.value;
+        renderSearchMode();
+        if (state.searchMode === 'currentListFilter') {
+          loadDirectory(state.path);
+        }
+      });
+
       filter.addEventListener('input', function () {
         state.filter = filter.value;
-        loadDirectory(state.path);
+        if (state.searchMode === 'currentListFilter') {
+          loadDirectory(state.path);
+        }
+      });
+
+      serverSearchSubmit.addEventListener('click', function () {
+        runServerSearch();
       });
 
       sortButtons.forEach(function (button) {
