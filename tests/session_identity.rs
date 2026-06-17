@@ -10,6 +10,7 @@ use file_hub::{
     config::AppConfig,
     http::{build_router, build_router_with_bootstrap_report},
 };
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use tempfile::TempDir;
 use tokio::fs;
 use tower::ServiceExt;
@@ -98,6 +99,7 @@ async fn test_should_create_admin_bootstrap_password_on_first_startup() -> Resul
 async fn test_should_login_with_bootstrap_password_and_show_admin_identity() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
     let config = config_from_storage_root(storage_root.path()).await?;
+    let database_path = config.database_path().to_owned();
     let built = build_router_with_bootstrap_report(config)
         .await
         .context("build router with bootstrap report")?;
@@ -128,6 +130,21 @@ async fn test_should_login_with_bootstrap_password_and_show_admin_identity() -> 
         .to_str()
         .context("session cookie should be ASCII")?
         .to_owned();
+    assert!(session_cookie.contains("HttpOnly"));
+    assert!(session_cookie.contains("Secure"));
+    assert!(session_cookie.contains("SameSite=Lax"));
+    let session_token = session_token_from_cookie(&session_cookie)?;
+    assert_eq!(session_token.len(), 64);
+    assert!(session_token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    let stored_token_hash = stored_session_token_hash(&database_path).await?;
+    assert_ne!(stored_token_hash, session_token);
+    assert_eq!(stored_token_hash.len(), 64);
+    assert!(
+        stored_token_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
 
     let identity = app
         .oneshot(
@@ -209,6 +226,64 @@ async fn test_should_logout_and_return_to_anonymous_identity() -> Result<()> {
     );
     assert_eq!(
         identity.pointer("/actions/login"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_oversized_passwords_without_revoking_current_session() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let bootstrap_password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let session_cookie = login_session_cookie(app.clone(), "admin", &bootstrap_password).await?;
+    let oversized_password = "a".repeat(257);
+
+    let oversized_login = app
+        .clone()
+        .oneshot(json_request(
+            "/api/login",
+            serde_json::json!({
+                "username": "admin",
+                "password": &oversized_password,
+            }),
+        )?)
+        .await
+        .context("send oversized login request")?;
+    assert_eq!(oversized_login.status(), StatusCode::UNAUTHORIZED);
+
+    let oversized_change = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/password")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "oldPassword": bootstrap_password,
+                        "newPassword": &oversized_password,
+                    })
+                    .to_string(),
+                ))
+                .context("build oversized password change request")?,
+        )
+        .await
+        .context("send oversized password change request")?;
+    assert_eq!(oversized_change.status(), StatusCode::UNAUTHORIZED);
+
+    let identity = identity_with_cookie(app, &session_cookie).await?;
+    assert_eq!(
+        identity.pointer("/authenticated"),
         Some(&serde_json::Value::Bool(true))
     );
     Ok(())
@@ -544,6 +619,25 @@ async fn response_json(response: axum::response::Response) -> Result<serde_json:
         .await
         .context("read response body")?;
     serde_json::from_slice(&body).context("parse response JSON")
+}
+
+async fn stored_session_token_hash(database_path: &Path) -> Result<String> {
+    let options = SqliteConnectOptions::new().filename(database_path);
+    let pool = SqlitePool::connect_with(options)
+        .await
+        .context("connect to auth SQLite database")?;
+    let (token_hash,) = sqlx::query_as::<_, (String,)>("SELECT token_hash FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .context("read stored session token hash")?;
+    Ok(token_hash)
+}
+
+fn session_token_from_cookie(cookie: &str) -> Result<&str> {
+    cookie
+        .split(';')
+        .find_map(|segment| segment.trim().strip_prefix("fh_session="))
+        .context("session cookie should include token")
 }
 
 async fn assert_error(

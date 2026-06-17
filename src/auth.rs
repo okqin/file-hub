@@ -7,6 +7,7 @@ use argon2::{
     password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
 use getrandom::fill as fill_random;
+use sha2::{Digest, Sha256};
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -19,6 +20,7 @@ const BOOTSTRAP_PASSWORD_BYTES: usize = 18;
 const SESSION_TOKEN_BYTES: usize = 32;
 const MAX_USERNAME_BYTES: usize = 64;
 const MIN_PASSWORD_BYTES: usize = 8;
+const MAX_PASSWORD_BYTES: usize = 256;
 
 /// Authentication and session storage backed by `SQLite`.
 #[derive(Clone, Debug)]
@@ -217,8 +219,9 @@ impl AuthState {
         }
 
         let token = generate_secret_hex(SESSION_TOKEN_BYTES)?;
-        sqlx::query("INSERT INTO sessions (token, user_id) VALUES (?, ?)")
-            .bind(&token)
+        let token_hash = hash_session_token(&token);
+        sqlx::query("INSERT INTO sessions (token_hash, user_id) VALUES (?, ?)")
+            .bind(token_hash)
             .bind(user_id)
             .execute(&self.pool)
             .await?;
@@ -242,11 +245,12 @@ impl AuthState {
             return Ok(None);
         }
 
+        let token_hash = hash_session_token(session_token);
         let identity = sqlx::query_as::<_, (String, i64)>(
             "SELECT users.username, users.is_admin FROM sessions JOIN users ON users.id = \
-             sessions.user_id WHERE sessions.token = ?",
+             sessions.user_id WHERE sessions.token_hash = ?",
         )
-        .bind(session_token)
+        .bind(token_hash)
         .fetch_optional(&self.pool)
         .await?
         .map(|(username, is_admin)| Identity {
@@ -270,8 +274,9 @@ impl AuthState {
             return Ok(());
         }
 
-        sqlx::query("DELETE FROM sessions WHERE token = ?")
-            .bind(session_token)
+        let token_hash = hash_session_token(session_token);
+        sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
+            .bind(token_hash)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -298,11 +303,12 @@ impl AuthState {
             return Ok(false);
         }
 
+        let token_hash = hash_session_token(session_token);
         let Some((user_id, password_hash)) = sqlx::query_as::<_, (i64, String)>(
             "SELECT users.id, users.password_hash FROM sessions JOIN users ON users.id = \
-             sessions.user_id WHERE sessions.token = ?",
+             sessions.user_id WHERE sessions.token_hash = ?",
         )
-        .bind(session_token)
+        .bind(token_hash)
         .fetch_optional(&self.pool)
         .await?
         else {
@@ -413,7 +419,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), AuthError> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
+            token_hash TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE
         )",
     )
@@ -449,7 +455,6 @@ async fn hash_password(password: String) -> Result<String, AuthError> {
     .await?
 }
 
-#[allow(dead_code)]
 async fn verify_password(password: String, password_hash: String) -> Result<bool, AuthError> {
     tokio::task::spawn_blocking(move || {
         let parsed_hash = PasswordHash::new(&password_hash)
@@ -465,6 +470,11 @@ fn generate_secret_hex(byte_count: usize) -> Result<String, AuthError> {
     let mut bytes = vec![0u8; byte_count];
     fill_random(&mut bytes)?;
     Ok(hex_encode(&bytes))
+}
+
+fn hash_session_token(session_token: &str) -> String {
+    let digest = Sha256::digest(session_token.as_bytes());
+    hex_encode(&digest)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -497,7 +507,7 @@ fn normalize_username(username: &str) -> String {
 }
 
 fn is_valid_password(password: &str) -> bool {
-    password.len() >= MIN_PASSWORD_BYTES
+    (MIN_PASSWORD_BYTES..=MAX_PASSWORD_BYTES).contains(&password.len())
 }
 
 fn is_valid_session_token(session_token: &str) -> bool {
