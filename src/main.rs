@@ -26,7 +26,11 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind HTTP listener at {bind_address}"))?;
 
     info!(%bind_address, "serving File Hub");
-    axum::serve(listener, build_router(config))
+    let router = build_router(config)
+        .await
+        .context("initialize HTTP router")?;
+
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve HTTP requests")
