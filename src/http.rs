@@ -35,6 +35,7 @@ pub fn build_router(config: AppConfig) -> Router {
         .route("/", get(index))
         .route("/api/list", get(list_root_directory))
         .route("/api/download", get(download_file))
+        .route("/api/archive", get(download_directory_archive))
         .with_state(state)
         .layer(ServiceBuilder::new().layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -128,6 +129,30 @@ async fn download_file(
     Ok(response)
 }
 
+async fn download_directory_archive(
+    State(state): State<AppState>,
+    Query(query): Query<DownloadQuery>,
+) -> Result<Response, ApiError> {
+    let path = query
+        .path
+        .as_deref()
+        .ok_or(resource::ResourceError::InvalidResourcePath)?;
+    let download = resource::download_directory_archive(&state.config, path).await?;
+    let content_disposition = content_disposition_header(&download.download_name)?;
+    let content_length = HeaderValue::from_str(&download.content_length.to_string())
+        .map_err(|_| ApiError::internal_server_error())?;
+
+    let mut response = Body::from(download.content).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    headers.insert(header::CONTENT_DISPOSITION, content_disposition);
+    headers.insert(header::CONTENT_LENGTH, content_length);
+    Ok(response)
+}
+
 impl From<resource::ResourceError> for ApiError {
     fn from(error: resource::ResourceError) -> Self {
         match error {
@@ -151,6 +176,11 @@ impl From<resource::ResourceError> for ApiError {
                 code: "not_file",
                 reason: "resource path is not a file".to_owned(),
             },
+            resource::ResourceError::RootDirectoryArchive => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "root_directory_archive",
+                reason: "Root Directory cannot be downloaded as an archive".to_owned(),
+            },
             resource::ResourceError::ResourceNotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "resource_not_found",
@@ -161,6 +191,20 @@ impl From<resource::ResourceError> for ApiError {
                 code: "listing_limit_exceeded",
                 reason: format!("direct child listing exceeds configured limit of {limit}"),
             },
+            resource::ResourceError::ArchiveResourceCountLimitExceeded { limit } => Self {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "archive_resource_count_limit_exceeded",
+                reason: format!(
+                    "directory archive exceeds configured resource count limit of {limit}"
+                ),
+            },
+            resource::ResourceError::ArchiveSizeLimitExceeded { limit } => Self {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "archive_size_limit_exceeded",
+                reason: format!(
+                    "directory archive exceeds configured uncompressed size limit of {limit} bytes",
+                ),
+            },
             resource::ResourceError::InvalidResourceName => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "invalid_resource_name",
@@ -170,7 +214,11 @@ impl From<resource::ResourceError> for ApiError {
             | resource::ResourceError::ReadEntry(_)
             | resource::ResourceError::Metadata(_)
             | resource::ResourceError::ModifiedTime(_)
-            | resource::ResourceError::ReadFile(_) => Self {
+            | resource::ResourceError::ReadFile(_)
+            | resource::ResourceError::ReadArchiveFile(_)
+            | resource::ResourceError::ZipArchive(_)
+            | resource::ResourceError::WriteArchive(_)
+            | resource::ResourceError::ArchiveLengthOverflow => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "resource_listing_failed",
                 reason: "failed to read Resource".to_owned(),
@@ -393,10 +441,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <th>Kind</th>
             <th><button type="button" class="sort-button" data-sort-field="size">Size<span class="sort-direction" data-sort-indicator="size"></span></button></th>
             <th><button type="button" class="sort-button" data-sort-field="modifiedTime">Modified<span class="sort-direction" data-sort-indicator="modifiedTime"></span></button></th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody id="resources">
-          <tr><td colspan="4" class="muted">Loading</td></tr>
+          <tr><td colspan="5" class="muted">Loading</td></tr>
         </tbody>
       </table>
     </section>
@@ -487,6 +536,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
         window.location.assign('/api/download?path=' + encodeURIComponent(resourcePath));
       }
 
+      function downloadDirectoryArchive(resourcePath) {
+        window.location.assign('/api/archive?path=' + encodeURIComponent(resourcePath));
+      }
+
       function renderSort(sort) {
         state.sort = sort.field || state.sort;
         state.order = sort.order || state.order;
@@ -501,7 +554,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         if (!rows.length) {
           var emptyRow = document.createElement('tr');
           var emptyCell = document.createElement('td');
-          emptyCell.colSpan = 4;
+          emptyCell.colSpan = 5;
           emptyCell.className = 'muted';
           emptyCell.appendChild(text('Empty'));
           emptyRow.appendChild(emptyCell);
@@ -536,10 +589,22 @@ const INDEX_HTML: &str = r#"<!doctype html>
           size.appendChild(text(resource.size));
           var modified = document.createElement('td');
           modified.appendChild(text(resource.modifiedTime));
+          var actions = document.createElement('td');
+          if (resource.kind === 'directory') {
+            var archive = document.createElement('button');
+            archive.type = 'button';
+            archive.setAttribute('aria-label', 'Download archive for ' + resource.name);
+            archive.appendChild(text('Download archive'));
+            archive.addEventListener('click', function () {
+              downloadDirectoryArchive(resource.resourcePath);
+            });
+            actions.appendChild(archive);
+          }
           row.appendChild(name);
           row.appendChild(kind);
           row.appendChild(size);
           row.appendChild(modified);
+          row.appendChild(actions);
           resources.appendChild(row);
         });
       }
@@ -548,7 +613,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         resources.textContent = '';
         var row = document.createElement('tr');
         var cell = document.createElement('td');
-        cell.colSpan = 4;
+        cell.colSpan = 5;
         cell.className = 'error';
         cell.appendChild(text(message));
         row.appendChild(cell);

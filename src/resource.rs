@@ -1,12 +1,17 @@
 //! Storage-root-backed resource listing.
 
-use std::{cmp::Ordering, path::PathBuf};
+use std::{
+    cmp::Ordering,
+    io::{Cursor, Write},
+    path::PathBuf,
+};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{fs, fs::File};
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::config::AppConfig;
 
@@ -118,6 +123,17 @@ pub struct FileDownload {
     pub content: File,
 }
 
+/// Directory Archive download payload.
+#[derive(Debug)]
+pub struct ArchiveDownload {
+    /// Directory Archive Download Name.
+    pub download_name: String,
+    /// Archive payload size in bytes.
+    pub content_length: u64,
+    /// Complete zip archive bytes.
+    pub content: Vec<u8>,
+}
+
 /// Resource listing failure.
 #[derive(Debug, Error)]
 pub enum ResourceError {
@@ -133,6 +149,9 @@ pub enum ResourceError {
     /// The requested resource path is not a file resource.
     #[error("resource path is not a file")]
     NotFile,
+    /// The Root Directory cannot be downloaded as an archive.
+    #[error("root directory cannot be downloaded as an archive")]
+    RootDirectoryArchive,
     /// The requested resource path does not exist.
     #[error("resource path does not exist")]
     ResourceNotFound,
@@ -141,6 +160,18 @@ pub enum ResourceError {
     ListingLimitExceeded {
         /// Configured direct child resource limit.
         limit: usize,
+    },
+    /// A Directory Archive would contain more resources than configured.
+    #[error("directory archive exceeds configured resource count limit of {limit}")]
+    ArchiveResourceCountLimitExceeded {
+        /// Configured archive resource count limit.
+        limit: usize,
+    },
+    /// A Directory Archive would contain more uncompressed bytes than configured.
+    #[error("directory archive exceeds configured uncompressed size limit of {limit} bytes")]
+    ArchiveSizeLimitExceeded {
+        /// Configured uncompressed archive byte limit.
+        limit: u64,
     },
     /// The storage root could not be read.
     #[error("failed to read directory")]
@@ -160,6 +191,18 @@ pub enum ResourceError {
     /// A file resource's content could not be read.
     #[error("failed to read file resource")]
     ReadFile(#[source] std::io::Error),
+    /// Directory Archive generation failed while reading file content.
+    #[error("failed to read archive resource")]
+    ReadArchiveFile(#[source] std::io::Error),
+    /// Directory Archive zip metadata generation failed.
+    #[error("failed to build directory archive")]
+    ZipArchive(#[source] zip::result::ZipError),
+    /// Directory Archive zip bytes could not be written.
+    #[error("failed to write directory archive")]
+    WriteArchive(#[source] std::io::Error),
+    /// Directory Archive payload length exceeded supported response metadata.
+    #[error("directory archive length is unsupported")]
+    ArchiveLengthOverflow,
 }
 
 /// List direct resources in the Root Directory.
@@ -290,6 +333,39 @@ pub async fn download_file(config: &AppConfig, path: &str) -> Result<FileDownloa
     })
 }
 
+/// Download a Directory Resource as a zip archive by Resource Path.
+///
+/// # Errors
+///
+/// Returns an error when the resource path is invalid, points at the Root Directory, contains the
+/// reserved staging directory, is not a Directory Resource, exceeds archive limits, or archive
+/// bytes cannot be generated.
+pub async fn download_directory_archive(
+    config: &AppConfig,
+    path: &str,
+) -> Result<ArchiveDownload, ResourceError> {
+    let resource_path = ResourcePath::parse(path)?;
+    if resource_path.as_str().is_empty() {
+        return Err(ResourceError::RootDirectoryArchive);
+    }
+    if resource_path.contains_reserved_name(config.staging_directory_name()) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+
+    let directory_path = resolve_directory_path(config.storage_root(), &resource_path).await?;
+    let directory_name = resource_path.file_name()?;
+    let entries = collect_archive_entries(config, directory_path, directory_name.clone()).await?;
+    let content = build_archive(entries).await?;
+    let content_length =
+        u64::try_from(content.len()).map_err(|_| ResourceError::ArchiveLengthOverflow)?;
+
+    Ok(ArchiveDownload {
+        download_name: format!("{directory_name}.zip"),
+        content_length,
+        content,
+    })
+}
+
 #[derive(Debug)]
 struct ResourcePath<'a> {
     raw: &'a str,
@@ -362,6 +438,19 @@ impl<'a> ResourcePath<'a> {
     }
 }
 
+#[derive(Debug)]
+struct ArchiveEntry {
+    archive_path: String,
+    filesystem_path: PathBuf,
+    kind: ArchiveEntryKind,
+}
+
+#[derive(Debug)]
+enum ArchiveEntryKind {
+    Directory,
+    File,
+}
+
 async fn resolve_directory_path(
     storage_root: &std::path::Path,
     resource_path: &ResourcePath<'_>,
@@ -383,6 +472,122 @@ async fn resolve_directory_path(
     }
 
     Ok(canonical)
+}
+
+async fn collect_archive_entries(
+    config: &AppConfig,
+    directory_path: PathBuf,
+    directory_name: String,
+) -> Result<Vec<ArchiveEntry>, ResourceError> {
+    let resource_count_limit = config.limits().archive_resource_count_limit().get();
+    let size_limit = config
+        .limits()
+        .archive_uncompressed_size_limit_bytes()
+        .get();
+    let mut resource_count = 1usize;
+    let mut uncompressed_size = 0u64;
+    let mut entries = vec![ArchiveEntry {
+        archive_path: format!("{directory_name}/"),
+        filesystem_path: directory_path.clone(),
+        kind: ArchiveEntryKind::Directory,
+    }];
+    let mut pending_directories = vec![(directory_path, directory_name)];
+
+    while let Some((current_directory, current_archive_path)) = pending_directories.pop() {
+        let mut read_dir = fs::read_dir(&current_directory)
+            .await
+            .map_err(ResourceError::ReadDirectory)?;
+
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(ResourceError::ReadEntry)?
+        {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ResourceError::InvalidResourceName)?;
+            if name == config.staging_directory_name() {
+                continue;
+            }
+
+            let metadata = fs::symlink_metadata(entry.path())
+                .await
+                .map_err(ResourceError::Metadata)?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            if !file_type.is_dir() && !file_type.is_file() {
+                continue;
+            }
+
+            resource_count = resource_count.checked_add(1).ok_or(
+                ResourceError::ArchiveResourceCountLimitExceeded {
+                    limit: resource_count_limit,
+                },
+            )?;
+            if resource_count > resource_count_limit {
+                return Err(ResourceError::ArchiveResourceCountLimitExceeded {
+                    limit: resource_count_limit,
+                });
+            }
+
+            let child_archive_path = format!("{current_archive_path}/{name}");
+            if file_type.is_dir() {
+                entries.push(ArchiveEntry {
+                    archive_path: format!("{child_archive_path}/"),
+                    filesystem_path: entry.path(),
+                    kind: ArchiveEntryKind::Directory,
+                });
+                pending_directories.push((entry.path(), child_archive_path));
+            } else {
+                uncompressed_size = uncompressed_size
+                    .checked_add(metadata.len())
+                    .ok_or(ResourceError::ArchiveSizeLimitExceeded { limit: size_limit })?;
+                if uncompressed_size > size_limit {
+                    return Err(ResourceError::ArchiveSizeLimitExceeded { limit: size_limit });
+                }
+
+                entries.push(ArchiveEntry {
+                    archive_path: child_archive_path,
+                    filesystem_path: entry.path(),
+                    kind: ArchiveEntryKind::File,
+                });
+            }
+        }
+    }
+
+    entries.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
+    Ok(entries)
+}
+
+async fn build_archive(entries: Vec<ArchiveEntry>) -> Result<Vec<u8>, ResourceError> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+
+    for entry in entries {
+        match entry.kind {
+            ArchiveEntryKind::Directory => writer
+                .add_directory(entry.archive_path, options)
+                .map_err(ResourceError::ZipArchive)?,
+            ArchiveEntryKind::File => {
+                let content = fs::read(entry.filesystem_path)
+                    .await
+                    .map_err(ResourceError::ReadArchiveFile)?;
+                writer
+                    .start_file(entry.archive_path, options)
+                    .map_err(ResourceError::ZipArchive)?;
+                writer
+                    .write_all(&content)
+                    .map_err(ResourceError::WriteArchive)?;
+            }
+        }
+    }
+
+    let cursor = writer.finish().map_err(ResourceError::ZipArchive)?;
+    Ok(cursor.into_inner())
 }
 
 async fn resolve_file_path(
