@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::fs;
+use tokio::{fs, fs::File};
 
 use crate::config::AppConfig;
 
@@ -112,8 +112,10 @@ pub enum ResourceKind {
 pub struct FileDownload {
     /// File Resource Name used as the suggested Download Name.
     pub download_name: String,
+    /// File size in bytes.
+    pub content_length: u64,
     /// Downloaded file content.
-    pub content: Vec<u8>,
+    pub content: File,
 }
 
 /// Resource listing failure.
@@ -265,7 +267,7 @@ pub async fn list_directory(
 /// # Errors
 ///
 /// Returns an error when the resource path is invalid, missing, outside the storage root, points
-/// at a Directory or symbolic link, or the file content cannot be read.
+/// at a Directory or symbolic link, or the file content cannot be opened.
 pub async fn download_file(config: &AppConfig, path: &str) -> Result<FileDownload, ResourceError> {
     let resource_path = ResourcePath::parse(path)?;
     if resource_path.as_str().is_empty() {
@@ -275,11 +277,15 @@ pub async fn download_file(config: &AppConfig, path: &str) -> Result<FileDownloa
         return Err(ResourceError::InvalidResourcePath);
     }
 
-    let file_path = resolve_file_path(config.storage_root(), &resource_path).await?;
-    let content = fs::read(file_path).await.map_err(ResourceError::ReadFile)?;
+    let (file_path, content_length) =
+        resolve_file_path(config.storage_root(), &resource_path).await?;
+    let content = File::open(file_path)
+        .await
+        .map_err(ResourceError::ReadFile)?;
 
     Ok(FileDownload {
         download_name: resource_path.file_name()?,
+        content_length,
         content,
     })
 }
@@ -382,7 +388,7 @@ async fn resolve_directory_path(
 async fn resolve_file_path(
     storage_root: &std::path::Path,
     resource_path: &ResourcePath<'_>,
-) -> Result<PathBuf, ResourceError> {
+) -> Result<(PathBuf, u64), ResourceError> {
     let Some((file_name, parent_segments)) = resource_path.segments.split_last() else {
         return Err(ResourceError::NotFile);
     };
@@ -411,7 +417,7 @@ async fn resolve_file_path(
         return Err(ResourceError::InvalidResourcePath);
     }
 
-    Ok(canonical)
+    Ok((canonical, metadata.len()))
 }
 
 fn map_resolve_error(error: std::io::Error) -> ResourceError {

@@ -11,6 +11,7 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
 use tower_http::timeout::TimeoutLayer;
 
@@ -111,12 +112,12 @@ async fn download_file(
         .as_deref()
         .ok_or(resource::ResourceError::InvalidResourcePath)?;
     let download = resource::download_file(&state.config, path).await?;
-    let content_length = download.content.len().to_string();
     let content_disposition = content_disposition_header(&download.download_name)?;
-    let content_length =
-        HeaderValue::from_str(&content_length).map_err(|_| ApiError::internal_server_error())?;
+    let content_length = HeaderValue::from_str(&download.content_length.to_string())
+        .map_err(|_| ApiError::internal_server_error())?;
 
-    let mut response = Body::from(download.content).into_response();
+    let stream = ReaderStream::new(download.content);
+    let mut response = Body::from_stream(stream).into_response();
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,

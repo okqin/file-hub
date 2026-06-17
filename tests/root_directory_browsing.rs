@@ -64,9 +64,36 @@ async fn test_should_download_file_resource_for_anonymous_http_request() -> Resu
         .await
         .context("read download response body")?;
     assert_eq!(body.as_ref(), b"hello from storage root");
-    assert!(
-        !String::from_utf8_lossy(&body).contains(&storage_root.path().to_string_lossy().as_ref())
+    let storage_root_text = storage_root.path().to_string_lossy();
+    assert!(!String::from_utf8_lossy(&body).contains(storage_root_text.as_ref()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_escape_download_name_in_content_disposition() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(
+        storage_root.path().join("report \"final\".txt"),
+        b"quoted download",
+    )
+    .await
+    .context("write file with quoted resource name")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let response = request_download(app, "report%20%22final%22.txt").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_DISPOSITION),
+        Some(&header::HeaderValue::from_static(
+            "attachment; filename=\"report \\\"final\\\".txt\"; \
+             filename*=UTF-8''report%20%22final%22.txt",
+        )),
     );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read quoted download response body")?;
+    assert_eq!(body.as_ref(), b"quoted download");
     Ok(())
 }
 
