@@ -5,20 +5,45 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Query, State},
-    http::{HeaderValue, StatusCode, header},
+    extract::{Path as AxumPath, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
 use tower_http::timeout::TimeoutLayer;
+use tracing::warn;
 
-use crate::{config::AppConfig, resource};
+use crate::{
+    auth::{AuthError, AuthState, BootstrapPassword, BootstrapReport},
+    config::AppConfig,
+    resource,
+};
+
+const SESSION_COOKIE_NAME: &str = "fh_session";
 
 /// Build the public HTTP router.
-pub fn build_router(config: AppConfig) -> Router {
+///
+/// # Errors
+///
+/// Returns an error when authentication/session storage cannot be initialized.
+pub async fn build_router(config: AppConfig) -> Result<Router, HttpInitError> {
+    Ok(build_router_with_bootstrap_report(config)
+        .await?
+        .into_router())
+}
+
+/// Build the public HTTP router and return startup bootstrap information.
+///
+/// # Errors
+///
+/// Returns an error when authentication/session storage cannot be initialized.
+pub async fn build_router_with_bootstrap_report(
+    config: AppConfig,
+) -> Result<RouterWithBootstrapReport, HttpInitError> {
     let timeout = std::time::Duration::from_secs(
         config
             .limits()
@@ -27,12 +52,26 @@ pub fn build_router(config: AppConfig) -> Router {
             .try_into()
             .map_or(300, |value| value),
     );
+    let (auth, bootstrap_report) = AuthState::initialize(config.database_path()).await?;
+    log_bootstrap_password(&bootstrap_report);
     let state = AppState {
         config: Arc::new(config),
+        auth,
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(index))
+        .route("/api/identity", get(identity))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/password", post(change_password))
+        .route("/api/console/users", post(console_create_user))
+        .route(
+            "/api/console/users/{username}",
+            delete(console_delete_user)
+                .patch(console_rename_user)
+                .put(console_replace_user),
+        )
         .route("/api/list", get(list_root_directory))
         .route("/api/search", get(search_resources))
         .route("/api/download", get(download_file))
@@ -41,12 +80,46 @@ pub fn build_router(config: AppConfig) -> Router {
         .layer(ServiceBuilder::new().layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             timeout,
-        )))
+        )));
+
+    Ok(RouterWithBootstrapReport {
+        router,
+        bootstrap_report,
+    })
+}
+
+/// Router plus Administrator bootstrap information from startup.
+#[derive(Debug)]
+pub struct RouterWithBootstrapReport {
+    router: Router,
+    bootstrap_report: BootstrapReport,
+}
+
+/// HTTP router initialization errors.
+#[derive(Debug, Error)]
+pub enum HttpInitError {
+    /// Authentication/session storage failed to initialize.
+    #[error("authentication storage initialization failed")]
+    Auth(#[from] AuthError),
+}
+
+impl RouterWithBootstrapReport {
+    /// Consume this value and return the HTTP router.
+    pub fn into_router(self) -> Router {
+        self.router
+    }
+
+    /// Return the Administrator bootstrap password if startup is still in the bootstrap window.
+    #[must_use]
+    pub const fn bootstrap_password(&self) -> Option<&BootstrapPassword> {
+        self.bootstrap_report.bootstrap_password()
+    }
 }
 
 #[derive(Clone, Debug)]
 struct AppState {
     config: Arc<AppConfig>,
+    auth: AuthState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +143,47 @@ struct SearchQuery {
     q: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PasswordChangeRequest {
+    old_password: String,
+    new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ConsoleUserRequest {
+    username: String,
+    #[allow(dead_code)]
+    password: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityResponse {
+    authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    actions: IdentityActions,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+struct IdentityActions {
+    login: bool,
+    password_change: bool,
+    logout: bool,
+    console: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorEnvelope {
     error: ErrorBody,
@@ -91,6 +205,150 @@ struct ApiError {
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+async fn identity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<IdentityResponse>, ApiError> {
+    let token = session_token_from_headers(&headers);
+    let identity = state.auth.identity_for_session(token.as_deref()).await?;
+
+    Ok(Json(match identity {
+        Some(identity) => IdentityResponse {
+            authenticated: true,
+            username: Some(identity.username().to_owned()),
+            actions: IdentityActions {
+                login: false,
+                password_change: true,
+                logout: true,
+                console: identity.is_admin(),
+            },
+        },
+        None => IdentityResponse {
+            authenticated: false,
+            username: None,
+            actions: IdentityActions {
+                login: true,
+                password_change: false,
+                logout: false,
+                console: false,
+            },
+        },
+    }))
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    let session = state
+        .auth
+        .login(&request.username, &request.password)
+        .await?
+        .ok_or_else(ApiError::invalid_credentials)?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, session_cookie_header(session.token())?);
+    Ok(response)
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    let token = session_token_from_headers(&headers);
+    state.auth.logout(token.as_deref()).await?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, expired_session_cookie_header());
+    Ok(response)
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PasswordChangeRequest>,
+) -> Result<Response, ApiError> {
+    let token = session_token_from_headers(&headers);
+    if !state
+        .auth
+        .change_password(
+            token.as_deref(),
+            &request.old_password,
+            &request.new_password,
+        )
+        .await?
+    {
+        return Err(ApiError::invalid_credentials());
+    }
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, expired_session_cookie_header());
+    Ok(response)
+}
+
+async fn console_create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ConsoleUserRequest>,
+) -> Result<Response, ApiError> {
+    require_admin(&state, &headers).await?;
+    reject_administrator_target(&request.username)?;
+    Err(ApiError::console_user_management_not_implemented())
+}
+
+async fn console_delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(username): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    require_admin(&state, &headers).await?;
+    reject_administrator_target(&username)?;
+    Err(ApiError::console_user_management_not_implemented())
+}
+
+async fn console_rename_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(username): AxumPath<String>,
+    Json(request): Json<ConsoleUserRequest>,
+) -> Result<Response, ApiError> {
+    require_admin(&state, &headers).await?;
+    reject_administrator_target(&username)?;
+    reject_administrator_target(&request.username)?;
+    Err(ApiError::console_user_management_not_implemented())
+}
+
+async fn console_replace_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(username): AxumPath<String>,
+    Json(request): Json<ConsoleUserRequest>,
+) -> Result<Response, ApiError> {
+    require_admin(&state, &headers).await?;
+    reject_administrator_target(&username)?;
+    reject_administrator_target(&request.username)?;
+    Err(ApiError::console_user_management_not_implemented())
+}
+
+async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let token = session_token_from_headers(headers);
+    let identity = state.auth.identity_for_session(token.as_deref()).await?;
+    match identity {
+        Some(identity) if identity.is_admin() => Ok(()),
+        Some(_identity) => Err(ApiError::forbidden()),
+        None => Err(ApiError::authentication_required()),
+    }
+}
+
+fn reject_administrator_target(username: &str) -> Result<(), ApiError> {
+    if username.eq_ignore_ascii_case("admin") {
+        Err(ApiError::reserved_administrator())
+    } else {
+        Ok(())
+    }
 }
 
 async fn list_root_directory(
@@ -253,12 +511,58 @@ impl From<resource::ResourceError> for ApiError {
     }
 }
 
+impl From<AuthError> for ApiError {
+    fn from(_error: AuthError) -> Self {
+        Self::internal_server_error()
+    }
+}
+
 impl ApiError {
     fn internal_server_error() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_server_error",
             reason: "internal server error".to_owned(),
+        }
+    }
+
+    fn invalid_credentials() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "invalid_credentials",
+            reason: "username or password is invalid".to_owned(),
+        }
+    }
+
+    fn authentication_required() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "authentication_required",
+            reason: "authentication is required".to_owned(),
+        }
+    }
+
+    fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            reason: "administrator identity is required".to_owned(),
+        }
+    }
+
+    fn reserved_administrator() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "reserved_administrator",
+            reason: "Administrator cannot be created, deleted, renamed, or replaced".to_owned(),
+        }
+    }
+
+    fn console_user_management_not_implemented() -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "console_user_management_not_implemented",
+            reason: "Console user management belongs to a later slice".to_owned(),
         }
     }
 }
@@ -317,6 +621,40 @@ fn upper_hex_digit(value: u8) -> char {
         0..=9 => char::from(b'0' + value),
         10..=15 => char::from(b'A' + (value - 10)),
         _ => '%',
+    }
+}
+
+fn session_cookie_header(token: &str) -> Result<HeaderValue, ApiError> {
+    let value = format!("{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Lax");
+    HeaderValue::from_str(&value).map_err(|_| ApiError::internal_server_error())
+}
+
+fn expired_session_cookie_header() -> HeaderValue {
+    HeaderValue::from_static("fh_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+}
+
+fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let header = headers.get(header::COOKIE)?.to_str().ok()?;
+    for cookie in header.split(';') {
+        let cookie = cookie.trim();
+        let Some(value) = cookie.strip_prefix(SESSION_COOKIE_NAME) else {
+            continue;
+        };
+        let Some(value) = value.strip_prefix('=') else {
+            continue;
+        };
+        return Some(value.to_owned());
+    }
+    None
+}
+
+fn log_bootstrap_password(report: &BootstrapReport) {
+    if let Some(password) = report.bootstrap_password() {
+        warn!(
+            username = password.username(),
+            bootstrap_password = password.plaintext_password(),
+            "Administrator bootstrap password is active",
+        );
     }
 }
 
@@ -453,7 +791,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <main>
     <header>
       <h1>File Hub</h1>
-      <div class="identity">Anonymous</div>
+      <div class="identity" aria-label="Identity Area" id="identity-area">
+        <span id="identity-username">Anonymous</span>
+        <button type="button" id="login-action">Login</button>
+        <button type="button" id="password-change-action" hidden>Change password</button>
+        <button type="button" id="logout-action" hidden>Logout</button>
+        <a href="/console" id="console-entry" hidden>Console</a>
+      </div>
     </header>
     <nav aria-label="Breadcrumb" class="breadcrumb" id="breadcrumb"></nav>
     <div class="toolbar">
@@ -494,6 +838,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       var searchMode = document.getElementById('search-mode');
       var filter = document.getElementById('current-list-filter');
       var serverSearchSubmit = document.getElementById('server-search-submit');
+      var identityUsername = document.getElementById('identity-username');
+      var loginAction = document.getElementById('login-action');
+      var passwordChangeAction = document.getElementById('password-change-action');
+      var logoutAction = document.getElementById('logout-action');
+      var consoleEntry = document.getElementById('console-entry');
       var sortButtons = Array.prototype.slice.call(document.querySelectorAll('[data-sort-field]'));
       var sortIndicators = Array.prototype.slice.call(document.querySelectorAll('[data-sort-indicator]'));
       var state = {
@@ -545,6 +894,67 @@ const INDEX_HTML: &str = r#"<!doctype html>
           .catch(function (error) {
             renderError(error.message);
           });
+      }
+
+      function loadIdentity() {
+        fetch('/api/identity')
+          .then(function (response) {
+            if (!response.ok) {
+              throw new Error('Identity load failed');
+            }
+            return response.json();
+          })
+          .then(renderIdentity)
+          .catch(function () {
+            renderIdentity({
+              authenticated: false,
+              actions: { login: true, passwordChange: false, logout: false, console: false }
+            });
+          });
+      }
+
+      function renderIdentity(identity) {
+        identityUsername.textContent = identity.authenticated ? identity.username : 'Anonymous';
+        loginAction.hidden = !identity.actions.login;
+        passwordChangeAction.hidden = !identity.actions.passwordChange;
+        logoutAction.hidden = !identity.actions.logout;
+        consoleEntry.hidden = !identity.actions.console;
+      }
+
+      function login() {
+        var username = window.prompt('Username');
+        if (!username) {
+          return;
+        }
+        var password = window.prompt('Password');
+        if (!password) {
+          return;
+        }
+        fetch('/api/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ username: username, password: password })
+        }).then(loadIdentity);
+      }
+
+      function changePassword() {
+        var oldPassword = window.prompt('Current password');
+        if (!oldPassword) {
+          return;
+        }
+        var newPassword = window.prompt('New password');
+        if (!newPassword) {
+          return;
+        }
+        fetch('/api/password', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ oldPassword: oldPassword, newPassword: newPassword })
+        }).then(loadIdentity);
+      }
+
+      function logout() {
+        fetch('/api/logout', { method: 'POST' }).then(loadIdentity);
       }
 
       function renderBreadcrumb(segments) {
@@ -761,6 +1171,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       returnToParent.addEventListener('click', function () {
         loadDirectory(parentPath(state.path));
       });
+      loginAction.addEventListener('click', login);
+      passwordChangeAction.addEventListener('click', changePassword);
+      logoutAction.addEventListener('click', logout);
 
       searchMode.addEventListener('change', function () {
         state.searchMode = searchMode.value;
@@ -794,6 +1207,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         });
       });
 
+      loadIdentity();
       loadDirectory('');
     }());
   </script>

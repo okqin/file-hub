@@ -1048,6 +1048,7 @@ async fn test_should_reject_invalid_configuration_before_serving_traffic() -> Re
     let config = format!(
         r#"
 storage_root: {storage_root:?}
+database_path: {database_path:?}
 server:
   bind_address: "127.0.0.1:0"
   time_zone: "Not/AZone"
@@ -1061,6 +1062,7 @@ limits:
   fs_concurrency_limit: 4
 "#,
         storage_root = storage_root.path().to_string_lossy(),
+        database_path = config_dir.path().join("file-hub.sqlite").to_string_lossy(),
     );
     fs::write(&config_path, config)
         .await
@@ -1254,6 +1256,7 @@ async fn app_from_storage_root_with_archive_limits(
     let config = format!(
         r#"
 storage_root: {storage_root:?}
+database_path: {database_path:?}
 staging_directory_name: ".fh-staging"
 server:
   bind_address: "127.0.0.1:0"
@@ -1268,6 +1271,7 @@ limits:
   fs_concurrency_limit: 4
 "#,
         storage_root = storage_root.to_string_lossy(),
+        database_path = config_dir.path().join("file-hub.sqlite").to_string_lossy(),
     );
     fs::write(&config_path, config)
         .await
@@ -1276,7 +1280,7 @@ limits:
     let config = AppConfig::load_from_path(&config_path)
         .await
         .context("load app config")?;
-    Ok(build_router(config))
+    build_router(config).await.context("build app router")
 }
 
 async fn app_from_storage_root_with_search_limits(
@@ -1291,6 +1295,7 @@ async fn app_from_storage_root_with_search_limits(
     let config = format!(
         r#"
 storage_root: {storage_root:?}
+database_path: {database_path:?}
 staging_directory_name: ".fh-staging"
 server:
   bind_address: "127.0.0.1:0"
@@ -1305,6 +1310,7 @@ limits:
   fs_concurrency_limit: 4
 "#,
         storage_root = storage_root.to_string_lossy(),
+        database_path = config_dir.path().join("file-hub.sqlite").to_string_lossy(),
     );
     fs::write(&config_path, config)
         .await
@@ -1313,7 +1319,7 @@ limits:
     let config = AppConfig::load_from_path(&config_path)
         .await
         .context("load app config")?;
-    Ok(build_router(config))
+    build_router(config).await.context("build app router")
 }
 
 fn resource_names(body: &Value) -> Result<Vec<&str>> {

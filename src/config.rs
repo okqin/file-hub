@@ -17,6 +17,7 @@ use validator::{Validate, ValidationError, ValidationErrors};
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     storage_root: PathBuf,
+    database_path: PathBuf,
     staging_directory_name: String,
     server: ServerConfig,
     limits: RuntimeLimits,
@@ -77,6 +78,7 @@ pub enum AppConfigError {
 #[serde(deny_unknown_fields)]
 struct RawAppConfig {
     storage_root: PathBuf,
+    database_path: Option<PathBuf>,
     #[serde(default = "default_staging_directory_name")]
     staging_directory_name: String,
     server: RawServerConfig,
@@ -256,6 +258,11 @@ impl AppConfig {
         };
 
         Ok(Self {
+            database_path: raw.database_path.unwrap_or_else(|| {
+                storage_root
+                    .join(&raw.staging_directory_name)
+                    .join("file-hub.sqlite")
+            }),
             storage_root,
             staging_directory_name: raw.staging_directory_name,
             server,
@@ -267,6 +274,12 @@ impl AppConfig {
     #[must_use]
     pub fn storage_root(&self) -> &Path {
         &self.storage_root
+    }
+
+    /// Return the `SQLite` database path used for authentication and sessions.
+    #[must_use]
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     /// Return the reserved staging directory name filtered from resource listings.

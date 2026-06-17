@@ -404,7 +404,7 @@ pub async fn search_resources(
         {
             entries.push(entry);
         }
-        entries.sort_by_key(|entry| entry.file_name());
+        entries.sort_by_key(tokio::fs::DirEntry::file_name);
 
         for entry in entries {
             if traversed_resources == traversal_limit {
