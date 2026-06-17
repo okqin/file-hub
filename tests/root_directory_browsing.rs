@@ -582,7 +582,21 @@ async fn test_should_reject_server_search_query_shorter_than_two_non_whitespace_
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
 
     let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
-    let response = request_search(app, "q=%20a%20").await?;
+    let response = request_search(app.clone(), "q=%20a%20").await?;
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_search_query").await?;
+
+    let response = request_search(app, "q=%E5%AD%97").await?;
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_search_query").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_server_search_query_over_configured_length() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+
+    let app = app_from_storage_root(storage_root.path(), 10, "UTC").await?;
+    let long_query = "a".repeat(257);
+    let response = request_search(app, &format!("q={long_query}")).await?;
 
     assert_error(response, StatusCode::BAD_REQUEST, "invalid_search_query").await?;
     Ok(())
@@ -635,6 +649,39 @@ async fn test_should_return_flat_nested_server_search_results_with_containing_pa
         ],
     );
     assert_eq!(body.get("truncated"), Some(&Value::Bool(false)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_disambiguate_same_named_server_search_results_with_containing_paths()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::create_dir(storage_root.path().join("alpha"))
+        .await
+        .context("create alpha directory")?;
+    fs::create_dir(storage_root.path().join("beta"))
+        .await
+        .context("create beta directory")?;
+    fs::write(
+        storage_root.path().join("alpha").join("report.txt"),
+        b"alpha",
+    )
+    .await
+    .context("write alpha report")?;
+    fs::write(storage_root.path().join("beta").join("report.txt"), b"beta")
+        .await
+        .context("write beta report")?;
+
+    let app = app_from_storage_root(storage_root.path(), 20, "UTC").await?;
+    let body = get_search(app, "q=report").await?;
+
+    assert_eq!(
+        search_resources(&body)?,
+        vec![
+            ("report.txt", "alpha/report.txt", "alpha"),
+            ("report.txt", "beta/report.txt", "beta"),
+        ],
+    );
     Ok(())
 }
 

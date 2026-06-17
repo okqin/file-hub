@@ -15,6 +15,8 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::config::AppConfig;
 
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
+
 /// Root directory listing response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -373,7 +375,8 @@ pub async fn download_directory_archive(
 ///
 /// # Errors
 ///
-/// Returns an error when the query is shorter than two non-whitespace characters.
+/// Returns an error when the query is shorter than two non-whitespace characters or exceeds the
+/// maximum query length.
 pub async fn search_resources(
     config: &AppConfig,
     query: &str,
@@ -766,7 +769,12 @@ fn map_resolve_error(error: std::io::Error) -> ResourceError {
 }
 
 fn validate_search_query(query: &str) -> Result<(), ResourceError> {
-    if query.trim().len() < 2 {
+    let non_whitespace_characters = query
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .take(2)
+        .count();
+    if non_whitespace_characters < 2 || query.len() > MAX_SEARCH_QUERY_BYTES {
         return Err(ResourceError::InvalidSearchQuery);
     }
 
