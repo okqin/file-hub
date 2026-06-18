@@ -181,6 +181,9 @@ pub enum ResourceError {
     /// The Root Directory cannot be renamed.
     #[error("root directory cannot be renamed")]
     RootDirectoryRename,
+    /// The Root Directory cannot be deleted.
+    #[error("root directory cannot be deleted")]
+    RootDirectoryDelete,
     /// The requested resource path does not exist.
     #[error("resource path does not exist")]
     ResourceNotFound,
@@ -280,6 +283,17 @@ pub enum ResourceError {
     /// A File or Directory Resource could not be renamed.
     #[error("failed to rename resource")]
     RenameResource(#[source] std::io::Error),
+    /// A File or Directory Resource could not be deleted.
+    #[error("failed to {operation} at {path}")]
+    DeleteResource {
+        /// Resource Path affected by the first failure.
+        path: String,
+        /// Filesystem operation that failed.
+        operation: &'static str,
+        /// Underlying filesystem reason.
+        #[source]
+        source: std::io::Error,
+    },
     /// One uploaded File exceeded the configured byte limit.
     #[error("uploaded file exceeds configured size limit of {limit} bytes")]
     UploadSingleFileSizeLimitExceeded {
@@ -513,6 +527,132 @@ pub async fn rename_resource(
     .await
     .map_err(|error| ResourceError::RenameResource(std::io::Error::other(error)))??;
     Ok(())
+}
+
+/// Delete a File Resource or recursively delete a Directory Resource.
+///
+/// # Errors
+///
+/// Returns an error when the Resource Path is invalid, the target is not a regular File or
+/// Directory, or the target cannot be removed.
+pub async fn delete_resource(config: &AppConfig, path: &str) -> Result<(), ResourceError> {
+    let resource_path = ResourcePath::parse(path)?;
+    if resource_path.contains_reserved_name(config.staging_directory_name()) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+    let Some((target_name, parent_segments)) = resource_path.segments.split_last() else {
+        return Err(ResourceError::RootDirectoryDelete);
+    };
+
+    let storage_root = config.storage_root().to_path_buf();
+    let parent_segments = parent_segments
+        .iter()
+        .map(|segment| (*segment).to_owned())
+        .collect::<Vec<_>>();
+    let target_name = (*target_name).to_owned();
+    let requested_path = path.to_owned();
+    let task_path = requested_path.clone();
+    task::spawn_blocking(move || {
+        let root = Dir::open_ambient_dir(storage_root, ambient_authority())
+            .map_err(|error| delete_failure(&task_path, "open storage root", error))?;
+        let parent = open_relative_directory(&root, &parent_segments)?;
+        let metadata = parent
+            .symlink_metadata(&target_name)
+            .map_err(map_resolve_error)?;
+        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(ResourceError::InvalidResourcePath);
+        }
+        if metadata.is_dir() {
+            remove_directory_resource(&parent, &target_name, &task_path)?;
+        } else {
+            parent
+                .remove_file(&target_name)
+                .map_err(|error| delete_failure(&task_path, "delete File", error))?;
+        }
+        match parent.symlink_metadata(&target_name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(delete_failure(&task_path, "verify deleted Resource", error)),
+            Ok(_) => Err(delete_failure(
+                &task_path,
+                "verify deleted Resource",
+                std::io::Error::other("target Resource still exists after deletion"),
+            )),
+        }
+    })
+    .await
+    .map_err(|error| delete_failure(&requested_path, "complete Delete", error.into()))??;
+    Ok(())
+}
+
+fn remove_directory_resource(
+    parent: &Dir,
+    name: &str,
+    resource_path: &str,
+) -> Result<(), ResourceError> {
+    let directory = parent
+        .open_dir(name)
+        .map_err(|error| delete_failure(resource_path, "open Directory", error))?;
+    let entries = directory
+        .entries()
+        .map_err(|error| delete_failure(resource_path, "read Directory", error))?;
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| delete_failure(resource_path, "read Directory", error))?;
+        let child_name = entry.file_name();
+        let child_name = child_name.to_str().ok_or_else(|| {
+            delete_failure(
+                resource_path,
+                "read Resource Name",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Resource Name is not valid UTF-8",
+                ),
+            )
+        })?;
+        let child_path = join_resource_path(resource_path, child_name);
+        let metadata = directory
+            .symlink_metadata(child_name)
+            .map_err(|error| delete_failure(&child_path, "read Resource metadata", error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(delete_failure(
+                &child_path,
+                "delete symbolic link",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "symbolic links are not Resources",
+                ),
+            ));
+        }
+        if metadata.is_dir() {
+            remove_directory_resource(&directory, child_name, &child_path)?;
+        } else if metadata.is_file() {
+            directory
+                .remove_file(child_name)
+                .map_err(|error| delete_failure(&child_path, "delete File", error))?;
+        } else {
+            return Err(delete_failure(
+                &child_path,
+                "delete unsupported filesystem entry",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "filesystem entry is not a Resource",
+                ),
+            ));
+        }
+    }
+
+    parent
+        .remove_dir(name)
+        .map_err(|error| delete_failure(resource_path, "delete Directory", error))
+}
+
+fn delete_failure(path: &str, operation: &'static str, source: std::io::Error) -> ResourceError {
+    ResourceError::DeleteResource {
+        path: path.to_owned(),
+        operation,
+        source,
+    }
 }
 
 impl StagedFileUpload {
