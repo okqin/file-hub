@@ -47,6 +47,7 @@ pub async fn build_router(config: AppConfig) -> Result<Router, HttpInitError> {
 pub async fn build_router_with_bootstrap_report(
     config: AppConfig,
 ) -> Result<RouterWithBootstrapReport, HttpInitError> {
+    resource::cleanup_staging_remnants(&config).await?;
     let timeout = std::time::Duration::from_secs(
         config
             .limits()
@@ -57,9 +58,17 @@ pub async fn build_router_with_bootstrap_report(
     );
     let (auth, bootstrap_report) = AuthState::initialize(config.database_path()).await?;
     log_bootstrap_password(&bootstrap_report);
+    let multipart_metadata_limit = config
+        .limits()
+        .directory_upload_resource_count_limit()
+        .get()
+        .saturating_mul(resource::MAX_RESOURCE_PATH_BYTES.saturating_add(1024));
     let upload_body_limit = usize::try_from(config.limits().upload_total_size_limit_bytes().get())
-        .unwrap_or(usize::MAX)
-        .saturating_add(64 * 1024);
+        .map_or(usize::MAX, |limit| {
+            limit
+                .saturating_add(multipart_metadata_limit)
+                .saturating_add(64 * 1024)
+        });
     let state = AppState {
         config: Arc::new(config),
         auth,
@@ -125,6 +134,9 @@ pub struct RouterWithBootstrapReport {
 /// HTTP router initialization errors.
 #[derive(Debug, Error)]
 pub enum HttpInitError {
+    /// Reserved staging remnants could not be cleaned safely.
+    #[error("staging cleanup failed")]
+    StagingCleanup(#[from] resource::ResourceError),
     /// Authentication/session storage failed to initialize.
     #[error("authentication storage initialization failed")]
     Auth(#[from] AuthError),
@@ -279,6 +291,8 @@ struct ErrorEnvelope {
 #[serde(rename_all = "camelCase")]
 struct ErrorBody {
     code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     reason: String,
 }
 
@@ -286,6 +300,7 @@ struct ErrorBody {
 struct ApiError {
     status: StatusCode,
     code: &'static str,
+    path: Option<String>,
     reason: String,
 }
 
@@ -578,6 +593,8 @@ async fn upload_file(
         .map_err(|_| ApiError::invalid_upload_request())?;
     let mut path = None;
     let mut staged_upload: Option<resource::StagedFileUpload> = None;
+    let mut staged_directory: Option<resource::StagedDirectoryUpload> = None;
+    let mut relative_path = None;
 
     loop {
         let mut field = match multipart.next_field().await {
@@ -595,31 +612,31 @@ async fn upload_file(
                 let value = read_upload_path(&mut field).await?;
                 path = Some(value);
             }
+            Some("relativePath") if staged_upload.is_none() && relative_path.is_none() => {
+                let current_path = path
+                    .as_deref()
+                    .ok_or_else(ApiError::invalid_upload_request)?;
+                if staged_directory.is_none() {
+                    staged_directory = Some(
+                        resource::StagedDirectoryUpload::start(&state.config, current_path).await?,
+                    );
+                }
+                relative_path = Some(read_upload_path(&mut field).await?);
+            }
+            Some("file") if staged_directory.is_some() => {
+                let relative_path = relative_path
+                    .take()
+                    .ok_or_else(ApiError::invalid_upload_request)?;
+                let upload = staged_directory
+                    .as_mut()
+                    .ok_or_else(ApiError::invalid_upload_request)?;
+                stage_directory_file(upload, &relative_path, &mut field).await?;
+            }
             Some("file") if staged_upload.is_none() => {
                 let current_path = path
                     .as_deref()
                     .ok_or_else(ApiError::invalid_upload_request)?;
-                let filename = field
-                    .file_name()
-                    .map(str::to_owned)
-                    .ok_or_else(ApiError::invalid_upload_request)?;
-                let mut upload =
-                    resource::StagedFileUpload::start(&state.config, current_path, &filename)
-                        .await?;
-                loop {
-                    let Ok(chunk) = field.chunk().await else {
-                        upload.abort().await;
-                        return Err(ApiError::invalid_upload_request());
-                    };
-                    let Some(chunk) = chunk else {
-                        break;
-                    };
-                    if let Err(error) = upload.write_chunk(&chunk).await {
-                        upload.abort().await;
-                        return Err(error.into());
-                    }
-                }
-                staged_upload = Some(upload);
+                staged_upload = Some(stage_file(&state.config, current_path, &mut field).await?);
             }
             _ => {
                 if let Some(upload) = staged_upload {
@@ -630,11 +647,63 @@ async fn upload_file(
         }
     }
 
+    if let Some(upload) = staged_directory {
+        if relative_path.is_some() || staged_upload.is_some() {
+            upload.abort().await;
+            return Err(ApiError::invalid_upload_request());
+        }
+        upload.commit().await?;
+        return Ok(StatusCode::CREATED);
+    }
+
     staged_upload
         .ok_or_else(ApiError::invalid_upload_request)?
         .commit()
         .await?;
     Ok(StatusCode::CREATED)
+}
+
+async fn stage_directory_file(
+    upload: &mut resource::StagedDirectoryUpload,
+    relative_path: &str,
+    field: &mut Field<'_>,
+) -> Result<(), ApiError> {
+    upload.start_file(relative_path).await?;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|_| ApiError::invalid_upload_request())?
+    {
+        upload.write_chunk(&chunk).await?;
+    }
+    upload.finish_file().await?;
+    Ok(())
+}
+
+async fn stage_file(
+    config: &AppConfig,
+    current_path: &str,
+    field: &mut Field<'_>,
+) -> Result<resource::StagedFileUpload, ApiError> {
+    let filename = field
+        .file_name()
+        .map(str::to_owned)
+        .ok_or_else(ApiError::invalid_upload_request)?;
+    let mut upload = resource::StagedFileUpload::start(config, current_path, &filename).await?;
+    loop {
+        let Ok(chunk) = field.chunk().await else {
+            upload.abort().await;
+            return Err(ApiError::invalid_upload_request());
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if let Err(error) = upload.write_chunk(&chunk).await {
+            upload.abort().await;
+            return Err(error.into());
+        }
+    }
+    Ok(upload)
 }
 
 async fn read_upload_path(field: &mut Field<'_>) -> Result<String, ApiError> {
@@ -738,46 +807,55 @@ impl From<resource::ResourceError> for ApiError {
             resource::ResourceError::InvalidResourcePath => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_resource_path",
+                path: None,
                 reason: "resource path is invalid".to_owned(),
             },
             resource::ResourceError::InvalidFilter => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_filter",
+                path: None,
                 reason: "current list filter query is invalid".to_owned(),
             },
             resource::ResourceError::InvalidSearchQuery => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_search_query",
+                path: None,
                 reason: "server search query is invalid".to_owned(),
             },
             resource::ResourceError::NotDirectory => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "not_directory",
+                path: None,
                 reason: "resource path is not a directory".to_owned(),
             },
             resource::ResourceError::NotFile => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "not_file",
+                path: None,
                 reason: "resource path is not a file".to_owned(),
             },
             resource::ResourceError::RootDirectoryArchive => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "root_directory_archive",
+                path: None,
                 reason: "Root Directory cannot be downloaded as an archive".to_owned(),
             },
             resource::ResourceError::ResourceNotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "resource_not_found",
+                path: None,
                 reason: "resource path does not exist".to_owned(),
             },
             resource::ResourceError::ListingLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "listing_limit_exceeded",
+                path: None,
                 reason: format!("direct child listing exceeds configured limit of {limit}"),
             },
             resource::ResourceError::ArchiveResourceCountLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "archive_resource_count_limit_exceeded",
+                path: None,
                 reason: format!(
                     "directory archive exceeds configured resource count limit of {limit}"
                 ),
@@ -785,15 +863,21 @@ impl From<resource::ResourceError> for ApiError {
             resource::ResourceError::ArchiveSizeLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "archive_size_limit_exceeded",
+                path: None,
                 reason: format!(
                     "directory archive exceeds configured uncompressed size limit of {limit} bytes",
                 ),
             },
-            resource::ResourceError::InvalidResourceName => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "invalid_resource_name",
-                reason: "resource name is not valid UTF-8".to_owned(),
-            },
+            resource::ResourceError::InvalidResourceName => Self::invalid_resource_name(),
+            error @ (resource::ResourceError::InvalidDirectoryUploadPath { .. }
+            | resource::ResourceError::DirectoryUploadConflict { .. }
+            | resource::ResourceError::DirectoryUploadSingleFileSizeLimitExceeded {
+                ..
+            }
+            | resource::ResourceError::DirectoryUploadTotalSizeLimitExceeded { .. }
+            | resource::ResourceError::DirectoryUploadResourceCountLimitExceeded {
+                ..
+            }) => Self::from_directory_upload_error(error),
             error @ (resource::ResourceError::InvalidWriteResourceName
             | resource::ResourceError::NameConflict
             | resource::ResourceError::CreateDirectory(_)
@@ -811,6 +895,7 @@ impl From<resource::ResourceError> for ApiError {
             | resource::ResourceError::ArchiveLengthOverflow => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "resource_listing_failed",
+                path: None,
                 reason: "failed to read Resource".to_owned(),
             },
         }
@@ -823,22 +908,26 @@ impl From<AuthError> for ApiError {
             AuthError::InvalidUsername => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_username",
+                path: None,
                 reason: "username is invalid".to_owned(),
             },
             AuthError::InvalidPassword => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_password",
+                path: None,
                 reason: "password is invalid".to_owned(),
             },
             AuthError::ReservedAdministrator => Self::reserved_administrator(),
             AuthError::UsernameConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "username_conflict",
+                path: None,
                 reason: "username already exists".to_owned(),
             },
             AuthError::UserNotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "user_not_found",
+                path: None,
                 reason: "user was not found".to_owned(),
             },
             AuthError::Database(_)
@@ -877,36 +966,102 @@ impl From<&ManagedUser> for ManagedUserResponse {
 }
 
 impl ApiError {
+    fn invalid_resource_name() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "invalid_resource_name",
+            path: None,
+            reason: "resource name is not valid UTF-8".to_owned(),
+        }
+    }
+
+    fn from_directory_upload_error(error: resource::ResourceError) -> Self {
+        match error {
+            resource::ResourceError::InvalidDirectoryUploadPath { path } => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_directory_upload_path",
+                path: Some(path),
+                reason: "relative path contains an invalid Resource Name".to_owned(),
+            },
+            resource::ResourceError::DirectoryUploadConflict { path } => Self {
+                status: StatusCode::CONFLICT,
+                code: "directory_upload_conflict",
+                path: Some(path),
+                reason: "Directory Upload conflicts with an existing Resource".to_owned(),
+            },
+            resource::ResourceError::DirectoryUploadSingleFileSizeLimitExceeded { path, limit } => {
+                Self {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "directory_upload_single_file_size_limit_exceeded",
+                    path: Some(path),
+                    reason: format!(
+                        "File exceeds the configured Directory Upload single-file limit of \
+                         {limit} bytes"
+                    ),
+                }
+            }
+            resource::ResourceError::DirectoryUploadTotalSizeLimitExceeded { path, limit } => {
+                Self {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "directory_upload_total_size_limit_exceeded",
+                    path: Some(path),
+                    reason: format!(
+                        "File causes the Directory Upload total size limit of {limit} bytes to be \
+                         exceeded"
+                    ),
+                }
+            }
+            resource::ResourceError::DirectoryUploadResourceCountLimitExceeded { path, limit } => {
+                Self {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "directory_upload_resource_count_limit_exceeded",
+                    path: Some(path),
+                    reason: format!(
+                        "Resource causes the Directory Upload count limit of {limit} to be \
+                         exceeded"
+                    ),
+                }
+            }
+            _ => Self::internal_server_error(),
+        }
+    }
+
     fn from_write_error(error: &resource::ResourceError) -> Self {
         match error {
             resource::ResourceError::InvalidWriteResourceName => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_resource_name",
+                path: None,
                 reason: "Resource Name is invalid".to_owned(),
             },
             resource::ResourceError::NameConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "name_conflict",
+                path: None,
                 reason: "Resource Name conflicts with an existing Resource".to_owned(),
             },
             resource::ResourceError::CreateDirectory(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "create_directory_failed",
+                path: None,
                 reason: "failed to create Directory".to_owned(),
             },
             resource::ResourceError::UploadSingleFileSizeLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "upload_single_file_size_limit_exceeded",
+                path: None,
                 reason: format!("uploaded File exceeds configured size limit of {limit} bytes"),
             },
             resource::ResourceError::UploadTotalSizeLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "upload_total_size_limit_exceeded",
+                path: None,
                 reason: format!("upload exceeds configured total size limit of {limit} bytes"),
             },
             resource::ResourceError::StoreUpload(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "upload_failed",
+                path: None,
                 reason: "failed to store uploaded File".to_owned(),
             },
             _ => Self::internal_server_error(),
@@ -917,6 +1072,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_server_error",
+            path: None,
             reason: "internal server error".to_owned(),
         }
     }
@@ -925,6 +1081,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: "invalid_credentials",
+            path: None,
             reason: "username or password is invalid".to_owned(),
         }
     }
@@ -933,6 +1090,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: "authentication_required",
+            path: None,
             reason: "authentication is required".to_owned(),
         }
     }
@@ -941,6 +1099,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
+            path: None,
             reason: "administrator identity is required".to_owned(),
         }
     }
@@ -949,6 +1108,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "upload_permission_required",
+            path: None,
             reason: "Upload Permission is required".to_owned(),
         }
     }
@@ -957,6 +1117,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_upload_request",
+            path: None,
             reason: "upload request is invalid".to_owned(),
         }
     }
@@ -965,6 +1126,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_create_directory_request",
+            path: None,
             reason: "create Directory request is invalid".to_owned(),
         }
     }
@@ -973,6 +1135,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "reserved_administrator",
+            path: None,
             reason: "Administrator cannot be created, deleted, renamed, or replaced".to_owned(),
         }
     }
@@ -985,6 +1148,7 @@ impl IntoResponse for ApiError {
             Json(ErrorEnvelope {
                 error: ErrorBody {
                     code: self.code,
+                    path: self.path,
                     reason: self.reason,
                 },
             }),
@@ -1518,6 +1682,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="write-actions">
         <button type="button" id="upload-file-action" hidden>Upload file</button>
         <input type="file" id="upload-file-input" hidden>
+        <button type="button" id="upload-directory-action" hidden>Upload directory</button>
+        <input type="file" id="upload-directory-input" webkitdirectory hidden>
         <button type="button" id="create-directory-action" hidden>Create directory</button>
         <progress id="upload-progress" max="100" value="0" hidden></progress>
       </div>
@@ -1575,6 +1741,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       var consoleEntry = document.getElementById('console-entry');
       var uploadFileAction = document.getElementById('upload-file-action');
       var uploadFileInput = document.getElementById('upload-file-input');
+      var uploadDirectoryAction = document.getElementById('upload-directory-action');
+      var uploadDirectoryInput = document.getElementById('upload-directory-input');
       var createDirectoryAction = document.getElementById('create-directory-action');
       var createDirectoryDialog = document.getElementById('create-directory-dialog');
       var createDirectoryForm = document.getElementById('create-directory-form');
@@ -1658,6 +1826,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         logoutAction.hidden = !identity.actions.logout;
         consoleEntry.hidden = !identity.actions.console;
         uploadFileAction.hidden = !identity.actions.upload;
+        uploadDirectoryAction.hidden = !identity.actions.upload;
         createDirectoryAction.hidden = !identity.actions.upload;
       }
 
@@ -1674,6 +1843,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
         var form = new FormData();
         form.append('path', state.path);
         form.append('file', file, file.name);
+        sendUpload(form, uploadFileInput);
+      }
+
+      function uploadDirectory(files) {
+        var form = new FormData();
+        form.append('path', state.path);
+        Array.prototype.forEach.call(files, function (file) {
+          form.append('relativePath', file.webkitRelativePath);
+          form.append('file', file, file.name);
+        });
+        sendUpload(form, uploadDirectoryInput);
+      }
+
+      function sendUpload(form, input) {
         var request = new XMLHttpRequest();
         request.open('POST', '/api/upload');
         request.upload.onprogress = function (event) {
@@ -1684,7 +1867,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         };
         request.onload = function () {
           uploadProgress.hidden = true;
-          uploadFileInput.value = '';
+          input.value = '';
           if (request.status >= 200 && request.status < 300) {
             resetAfterWrite();
             return;
@@ -1695,7 +1878,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
           } catch (_error) {
             body = {};
           }
-          renderError(body.error && body.error.reason ? body.error.reason : 'Upload failed');
+          if (body.error && body.error.reason) {
+            renderError(body.error.path ? body.error.path + ': ' + body.error.reason : body.error.reason);
+          } else {
+            renderError('Upload failed');
+          }
         };
         request.onerror = function () {
           uploadProgress.hidden = true;
@@ -1989,6 +2176,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       uploadFileInput.addEventListener('change', function () {
         if (uploadFileInput.files && uploadFileInput.files.length === 1) {
           uploadFile(uploadFileInput.files[0]);
+        }
+      });
+      uploadDirectoryAction.addEventListener('click', function () {
+        uploadDirectoryInput.click();
+      });
+      uploadDirectoryInput.addEventListener('change', function () {
+        if (uploadDirectoryInput.files && uploadDirectoryInput.files.length > 0) {
+          uploadDirectory(uploadDirectoryInput.files);
         }
       });
       createDirectoryAction.addEventListener('click', createDirectory);

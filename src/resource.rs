@@ -1,7 +1,15 @@
 //! Storage-root-backed resource listing.
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+use std::os::fd::AsFd;
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     fmt::Write as FmtWrite,
     io::{Cursor, Write},
     path::PathBuf,
@@ -224,6 +232,42 @@ pub enum ResourceError {
     /// A Resource Name supplied for a write action is invalid.
     #[error("resource name is invalid")]
     InvalidWriteResourceName,
+    /// A browser-provided Directory Upload relative path contains an invalid Resource Name.
+    #[error("relative path contains an invalid Resource Name")]
+    InvalidDirectoryUploadPath {
+        /// First relative path that failed validation.
+        path: String,
+    },
+    /// A Directory Upload destination conflicts with an existing Resource.
+    #[error("Directory Upload conflicts with an existing Resource")]
+    DirectoryUploadConflict {
+        /// First relative path that conflicts.
+        path: String,
+    },
+    /// One File in a Directory Upload exceeded the configured byte limit.
+    #[error("Directory Upload file exceeds configured size limit of {limit} bytes")]
+    DirectoryUploadSingleFileSizeLimitExceeded {
+        /// First relative path that exceeded the limit.
+        path: String,
+        /// Configured single File byte limit.
+        limit: u64,
+    },
+    /// A Directory Upload exceeded the configured aggregate byte limit.
+    #[error("Directory Upload exceeds configured total size limit of {limit} bytes")]
+    DirectoryUploadTotalSizeLimitExceeded {
+        /// First relative path that caused the aggregate limit failure.
+        path: String,
+        /// Configured aggregate upload byte limit.
+        limit: u64,
+    },
+    /// A Directory Upload exceeded the configured Resource count limit.
+    #[error("Directory Upload exceeds configured Resource count limit of {limit}")]
+    DirectoryUploadResourceCountLimitExceeded {
+        /// First relative path that caused the Resource count limit failure.
+        path: String,
+        /// Configured Directory Upload Resource count limit.
+        limit: usize,
+    },
     /// A Resource already exists at the requested destination.
     #[error("resource name conflicts with an existing resource")]
     NameConflict,
@@ -261,6 +305,26 @@ pub struct StagedFileUpload {
     total_upload_limit: u64,
 }
 
+/// A Directory tree being assembled in the reserved staging area before atomic publication.
+#[derive(Debug)]
+pub struct StagedDirectoryUpload {
+    staging_directory: Dir,
+    staged_tree: Dir,
+    destination_directory: Dir,
+    staging_name: String,
+    reserved_name: String,
+    top_level_name: Option<String>,
+    active_file: Option<File>,
+    active_relative_path: Option<String>,
+    cleanup_staging: bool,
+    active_file_bytes: u64,
+    total_bytes: u64,
+    single_file_limit: u64,
+    total_upload_limit: u64,
+    resource_paths: HashSet<String>,
+    resource_count_limit: usize,
+}
+
 /// List direct resources in the Root Directory.
 ///
 /// # Errors
@@ -275,6 +339,77 @@ pub async fn list_root_directory(config: &AppConfig) -> Result<DirectoryListing,
         CurrentListFilter::default(),
     )
     .await
+}
+
+/// Remove interrupted upload remnants from the reserved staging Directory.
+///
+/// The configured `SQLite` database and its sidecar files are preserved when the database uses the
+/// default location inside staging.
+///
+/// # Errors
+///
+/// Returns an error when the staging Directory cannot be opened, inspected, or cleaned.
+pub async fn cleanup_staging_remnants(config: &AppConfig) -> Result<(), ResourceError> {
+    let storage_root = config.storage_root().to_path_buf();
+    let staging_directory_name = config.staging_directory_name().to_owned();
+    let staging_path = storage_root.join(&staging_directory_name);
+    let preserved_database_name = if config.database_path().parent() == Some(staging_path.as_path())
+    {
+        config
+            .database_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    task::spawn_blocking(move || {
+        let root = Dir::open_ambient_dir(storage_root, ambient_authority())
+            .map_err(ResourceError::StoreUpload)?;
+        let metadata = match root.symlink_metadata(&staging_directory_name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ResourceError::StoreUpload(error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ResourceError::StoreUpload(std::io::Error::other(
+                "reserved staging path is not a directory",
+            )));
+        }
+        let staging = root
+            .open_dir(&staging_directory_name)
+            .map_err(ResourceError::StoreUpload)?;
+        let entries = staging.entries().map_err(ResourceError::StoreUpload)?;
+        for entry in entries {
+            let entry = entry.map_err(ResourceError::StoreUpload)?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(ResourceError::InvalidResourceName)?;
+            if preserved_database_name.as_deref().is_some_and(|database| {
+                name == database
+                    || name == format!("{database}-wal")
+                    || name == format!("{database}-shm")
+                    || name == format!("{database}-journal")
+            }) {
+                continue;
+            }
+            let metadata = staging
+                .symlink_metadata(name)
+                .map_err(ResourceError::StoreUpload)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                staging
+                    .remove_dir_all(name)
+                    .map_err(ResourceError::StoreUpload)?;
+            } else {
+                staging
+                    .remove_file(name)
+                    .map_err(ResourceError::StoreUpload)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(blocking_task_error)??;
+    Ok(())
 }
 
 /// Create a Directory under the current Resource Path.
@@ -475,6 +610,344 @@ impl Drop for StagedFileUpload {
     }
 }
 
+impl StagedDirectoryUpload {
+    /// Start staging one Directory Upload under the current Resource Path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination Resource Path or staging area is unavailable.
+    pub async fn start(config: &AppConfig, path: &str) -> Result<Self, ResourceError> {
+        let resource_path = ResourcePath::parse(path)?;
+        if resource_path.contains_reserved_name(config.staging_directory_name()) {
+            return Err(ResourceError::InvalidResourcePath);
+        }
+
+        let storage_root = config.storage_root().to_path_buf();
+        let segments = owned_segments(&resource_path);
+        let staging_directory_name = config.staging_directory_name().to_owned();
+        let (staging_directory, staged_tree, destination_directory, staging_name) =
+            task::spawn_blocking(move || {
+                let root = Dir::open_ambient_dir(storage_root, ambient_authority())
+                    .map_err(ResourceError::StoreUpload)?;
+                let destination_directory = open_relative_directory(&root, &segments)?;
+                let staging_directory = open_staging_directory(&root, &staging_directory_name)?;
+                let staging_name = create_staging_name()?;
+                staging_directory
+                    .create_dir(&staging_name)
+                    .map_err(ResourceError::StoreUpload)?;
+                let staged_tree = staging_directory
+                    .open_dir(&staging_name)
+                    .map_err(ResourceError::StoreUpload)?;
+                Ok((
+                    staging_directory,
+                    staged_tree,
+                    destination_directory,
+                    staging_name,
+                ))
+            })
+            .await
+            .map_err(blocking_task_error)??;
+
+        Ok(Self {
+            staging_directory,
+            staged_tree,
+            destination_directory,
+            staging_name,
+            reserved_name: config.staging_directory_name().to_owned(),
+            top_level_name: None,
+            active_file: None,
+            active_relative_path: None,
+            cleanup_staging: true,
+            active_file_bytes: 0,
+            total_bytes: 0,
+            single_file_limit: config.limits().upload_single_file_size_limit_bytes().get(),
+            total_upload_limit: config.limits().upload_total_size_limit_bytes().get(),
+            resource_paths: HashSet::new(),
+            resource_count_limit: config
+                .limits()
+                .directory_upload_resource_count_limit()
+                .get(),
+        })
+    }
+
+    /// Start one File at its browser-provided relative path inside the staged Directory tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the relative path is invalid, belongs to another selected Directory,
+    /// or conflicts with another staged Resource.
+    pub async fn start_file(&mut self, relative_path: &str) -> Result<(), ResourceError> {
+        if self.active_file.is_some() {
+            return Err(ResourceError::StoreUpload(std::io::Error::other(
+                "previous staged file is incomplete",
+            )));
+        }
+        let nested_segments = self.validate_relative_path(relative_path)?;
+        let file = self
+            .create_staged_file(nested_segments, relative_path.to_owned())
+            .await?;
+        self.active_file = Some(file);
+        self.active_relative_path = Some(relative_path.to_owned());
+        self.active_file_bytes = 0;
+        Ok(())
+    }
+
+    fn validate_relative_path(
+        &mut self,
+        relative_path: &str,
+    ) -> Result<Vec<String>, ResourceError> {
+        let resource_path = ResourcePath::parse(relative_path).map_err(|_| {
+            ResourceError::InvalidDirectoryUploadPath {
+                path: relative_path.to_owned(),
+            }
+        })?;
+        if resource_path.contains_reserved_name(&self.reserved_name) {
+            return Err(ResourceError::InvalidDirectoryUploadPath {
+                path: relative_path.to_owned(),
+            });
+        }
+        let Some((top_level_name, nested_segments)) = resource_path.segments.split_first() else {
+            return Err(ResourceError::InvalidDirectoryUploadPath {
+                path: relative_path.to_owned(),
+            });
+        };
+        if nested_segments.is_empty() {
+            return Err(ResourceError::InvalidDirectoryUploadPath {
+                path: relative_path.to_owned(),
+            });
+        }
+        match self.top_level_name.as_deref() {
+            Some(expected) if expected != *top_level_name => {
+                return Err(ResourceError::InvalidDirectoryUploadPath {
+                    path: relative_path.to_owned(),
+                });
+            }
+            None => self.top_level_name = Some((*top_level_name).to_owned()),
+            Some(_) => {}
+        }
+        let mut cumulative_path = String::new();
+        for segment in &resource_path.segments {
+            if !cumulative_path.is_empty() {
+                cumulative_path.push('/');
+            }
+            cumulative_path.push_str(segment);
+            if self.resource_paths.insert(cumulative_path.clone())
+                && self.resource_paths.len() > self.resource_count_limit
+            {
+                return Err(ResourceError::DirectoryUploadResourceCountLimitExceeded {
+                    path: relative_path.to_owned(),
+                    limit: self.resource_count_limit,
+                });
+            }
+        }
+        Ok(nested_segments
+            .iter()
+            .map(|segment| (*segment).to_owned())
+            .collect())
+    }
+
+    async fn create_staged_file(
+        &self,
+        nested_segments: Vec<String>,
+        failure_path: String,
+    ) -> Result<File, ResourceError> {
+        let staged_tree = self
+            .staged_tree
+            .try_clone()
+            .map_err(ResourceError::StoreUpload)?;
+        task::spawn_blocking(move || {
+            let Some((file_name, parent_segments)) = nested_segments.split_last() else {
+                return Err(ResourceError::InvalidResourcePath);
+            };
+            let mut parent = staged_tree;
+            for segment in parent_segments {
+                match parent.create_dir(segment) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = parent
+                            .symlink_metadata(segment)
+                            .map_err(ResourceError::StoreUpload)?;
+                        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                            return Err(ResourceError::DirectoryUploadConflict {
+                                path: failure_path.clone(),
+                            });
+                        }
+                    }
+                    Err(error) => return Err(ResourceError::StoreUpload(error)),
+                }
+                parent = parent.open_dir(segment).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotADirectory {
+                        ResourceError::DirectoryUploadConflict {
+                            path: failure_path.clone(),
+                        }
+                    } else {
+                        ResourceError::StoreUpload(error)
+                    }
+                })?;
+            }
+            let mut options = CapOpenOptions::new();
+            options.write(true).create_new(true);
+            parent
+                .open_with(file_name, &options)
+                .map(|file| File::from_std(file.into_std()))
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        ResourceError::DirectoryUploadConflict { path: failure_path }
+                    } else {
+                        ResourceError::StoreUpload(error)
+                    }
+                })
+        })
+        .await
+        .map_err(blocking_task_error)?
+    }
+
+    /// Append a multipart chunk to the active staged File.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no File is active or the staging write fails.
+    pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ResourceError> {
+        let active_relative_path = self.active_relative_path.as_deref().ok_or_else(|| {
+            ResourceError::StoreUpload(std::io::Error::other("no staged file is active"))
+        })?;
+        let chunk_length = u64::try_from(chunk.len()).map_err(|_| {
+            ResourceError::DirectoryUploadSingleFileSizeLimitExceeded {
+                path: active_relative_path.to_owned(),
+                limit: self.single_file_limit,
+            }
+        })?;
+        let next_file_bytes = self
+            .active_file_bytes
+            .checked_add(chunk_length)
+            .ok_or_else(
+                || ResourceError::DirectoryUploadSingleFileSizeLimitExceeded {
+                    path: active_relative_path.to_owned(),
+                    limit: self.single_file_limit,
+                },
+            )?;
+        if next_file_bytes > self.single_file_limit {
+            return Err(ResourceError::DirectoryUploadSingleFileSizeLimitExceeded {
+                path: active_relative_path.to_owned(),
+                limit: self.single_file_limit,
+            });
+        }
+        let next_total_bytes = self.total_bytes.checked_add(chunk_length).ok_or_else(|| {
+            ResourceError::DirectoryUploadTotalSizeLimitExceeded {
+                path: active_relative_path.to_owned(),
+                limit: self.total_upload_limit,
+            }
+        })?;
+        if next_total_bytes > self.total_upload_limit {
+            return Err(ResourceError::DirectoryUploadTotalSizeLimitExceeded {
+                path: active_relative_path.to_owned(),
+                limit: self.total_upload_limit,
+            });
+        }
+        self.active_file
+            .as_mut()
+            .ok_or_else(|| {
+                ResourceError::StoreUpload(std::io::Error::other("no staged file is active"))
+            })?
+            .write_all(chunk)
+            .await
+            .map_err(ResourceError::StoreUpload)?;
+        self.active_file_bytes = next_file_bytes;
+        self.total_bytes = next_total_bytes;
+        Ok(())
+    }
+
+    /// Finish the active staged File and flush its content before accepting another File.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no File is active or syncing it fails.
+    pub async fn finish_file(&mut self) -> Result<(), ResourceError> {
+        let file = self.active_file.take().ok_or_else(|| {
+            ResourceError::StoreUpload(std::io::Error::other("no staged file is active"))
+        })?;
+        self.active_relative_path = None;
+        file.sync_all().await.map_err(ResourceError::StoreUpload)
+    }
+
+    /// Publish the complete staged Directory tree with one same-mount rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no Directory was staged, the destination conflicts, or publication
+    /// fails.
+    pub async fn commit(mut self) -> Result<(), ResourceError> {
+        if self.active_file.is_some() {
+            return Err(ResourceError::StoreUpload(std::io::Error::other(
+                "staged file is incomplete",
+            )));
+        }
+        let destination_name = self
+            .top_level_name
+            .clone()
+            .ok_or(ResourceError::InvalidResourcePath)?;
+        let conflict_path = destination_name.clone();
+        let staging_directory = self
+            .staging_directory
+            .try_clone()
+            .map_err(ResourceError::StoreUpload)?;
+        let destination_directory = self
+            .destination_directory
+            .try_clone()
+            .map_err(ResourceError::StoreUpload)?;
+        let staging_name = self.staging_name.clone();
+        task::spawn_blocking(move || {
+            rename_directory_noreplace(
+                &staging_directory,
+                &staging_name,
+                &destination_directory,
+                &destination_name,
+            )
+            .map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+                ) {
+                    ResourceError::DirectoryUploadConflict {
+                        path: conflict_path,
+                    }
+                } else {
+                    ResourceError::StoreUpload(error)
+                }
+            })
+        })
+        .await
+        .map_err(blocking_task_error)??;
+        self.cleanup_staging = false;
+        Ok(())
+    }
+
+    /// Remove a staged Directory tree after parsing or validation fails.
+    pub async fn abort(mut self) {
+        drop(self.active_file.take());
+        self.active_relative_path = None;
+        let Ok(staging_directory) = self.staging_directory.try_clone() else {
+            return;
+        };
+        let staging_name = self.staging_name.clone();
+        let _cleanup_result =
+            task::spawn_blocking(move || staging_directory.remove_dir_all(staging_name)).await;
+        self.cleanup_staging = false;
+    }
+}
+
+impl Drop for StagedDirectoryUpload {
+    fn drop(&mut self) {
+        drop(self.active_file.take());
+        if self.cleanup_staging
+            && let Err(error) = self.staging_directory.remove_dir_all(&self.staging_name)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, staging_name = %self.staging_name, "failed to clean up staged Directory Upload");
+        }
+    }
+}
+
 fn create_staging_name() -> Result<String, ResourceError> {
     let mut random = [0u8; 16];
     getrandom::fill(&mut random)
@@ -525,6 +998,48 @@ fn open_staging_directory(root: &Dir, name: &str) -> Result<Dir, ResourceError> 
         )));
     }
     root.open_dir(name).map_err(ResourceError::StoreUpload)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+fn rename_directory_noreplace(
+    source_directory: &Dir,
+    source_name: &str,
+    destination_directory: &Dir,
+    destination_name: &str,
+) -> Result<(), std::io::Error> {
+    rustix::fs::renameat_with(
+        source_directory.as_fd(),
+        source_name,
+        destination_directory.as_fd(),
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+    target_vendor = "apple"
+)))]
+fn rename_directory_noreplace(
+    source_directory: &Dir,
+    source_name: &str,
+    destination_directory: &Dir,
+    destination_name: &str,
+) -> Result<(), std::io::Error> {
+    match destination_directory.symlink_metadata(destination_name) {
+        Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    source_directory.rename(source_name, destination_directory, destination_name)
 }
 
 fn blocking_task_error(error: task::JoinError) -> ResourceError {
