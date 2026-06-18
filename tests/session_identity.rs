@@ -543,6 +543,815 @@ async fn test_should_reject_console_attempts_to_create_delete_rename_or_replace_
     Ok(())
 }
 
+#[tokio::test]
+async fn test_should_create_ordinary_user_through_console_api_and_log_in_with_permissions()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+
+    let create_user = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "Alice-1",
+                "password": "alice-password",
+                "permissions": {
+                    "upload": true,
+                    "rename": false,
+                    "delete": true,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send console create user request")?;
+
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+    let created = response_json(create_user).await?;
+    assert_eq!(
+        created.pointer("/username"),
+        Some(&serde_json::Value::String("Alice-1".to_owned()))
+    );
+    assert_eq!(
+        created.pointer("/permissions/upload"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        created.pointer("/permissions/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        created.pointer("/permissions/delete"),
+        Some(&serde_json::Value::Bool(true))
+    );
+
+    let user_cookie = login_session_cookie(app.clone(), "Alice-1", "alice-password").await?;
+    let identity = identity_with_cookie(app, &user_cookie).await?;
+    assert_eq!(
+        identity.pointer("/username"),
+        Some(&serde_json::Value::String("Alice-1".to_owned()))
+    );
+    assert_eq!(
+        identity.pointer("/actions/console"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        identity.pointer("/actions/upload"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        identity.pointer("/actions/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        identity.pointer("/actions/delete"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_allow_only_administrator_to_access_console_api_and_view() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+
+    let anonymous_api = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/console/users")
+                .body(Body::empty())
+                .context("build anonymous console API request")?,
+        )
+        .await
+        .context("send anonymous console API request")?;
+    assert_error(
+        anonymous_api,
+        StatusCode::UNAUTHORIZED,
+        "authentication_required",
+    )
+    .await?;
+
+    let anonymous_view = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/console")
+                .body(Body::empty())
+                .context("build anonymous console view request")?,
+        )
+        .await
+        .context("send anonymous console view request")?;
+    assert_error(
+        anonymous_view,
+        StatusCode::UNAUTHORIZED,
+        "authentication_required",
+    )
+    .await?;
+
+    let create_user = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "console-user",
+                "password": "console-user-password",
+                "permissions": {
+                    "upload": false,
+                    "rename": false,
+                    "delete": false,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send create ordinary user request")?;
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+    let user_cookie = login_session_cookie(app.clone(), "console-user", "console-user-password")
+        .await
+        .context("login ordinary user")?;
+
+    let ordinary_api = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/console/users")
+                .header(header::COOKIE, &user_cookie)
+                .body(Body::empty())
+                .context("build ordinary console API request")?,
+        )
+        .await
+        .context("send ordinary console API request")?;
+    assert_error(ordinary_api, StatusCode::FORBIDDEN, "forbidden").await?;
+
+    let ordinary_view = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/console")
+                .header(header::COOKIE, &user_cookie)
+                .body(Body::empty())
+                .context("build ordinary console view request")?,
+        )
+        .await
+        .context("send ordinary console view request")?;
+    assert_error(ordinary_view, StatusCode::FORBIDDEN, "forbidden").await?;
+
+    let admin_api = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/console/users")
+                .header(header::COOKIE, &admin_cookie)
+                .body(Body::empty())
+                .context("build admin console API request")?,
+        )
+        .await
+        .context("send admin console API request")?;
+    assert_eq!(admin_api.status(), StatusCode::OK);
+
+    let admin_view = app
+        .oneshot(
+            Request::builder()
+                .uri("/console")
+                .header(header::COOKIE, &admin_cookie)
+                .body(Body::empty())
+                .context("build admin console view request")?,
+        )
+        .await
+        .context("send admin console view request")?;
+    assert_eq!(admin_view.status(), StatusCode::OK);
+    let body = to_bytes(admin_view.into_body(), usize::MAX)
+        .await
+        .context("read console view body")?;
+    let body = String::from_utf8(body.to_vec()).context("console view must be UTF-8")?;
+    assert!(body.contains("aria-label=\"Console\""));
+    assert!(body.contains("id=\"create-user-action\""));
+    assert!(body.contains("id=\"anonymous-upload-permission\""));
+    assert!(body.contains("/api/console/users/${encodeURIComponent(username)}/permissions"));
+    assert!(body.contains("Reset password"));
+    assert!(body.contains("loadConsole().catch"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_authorize_console_requests_before_parsing_json_bodies() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+    let create_user = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "ordinary-user",
+                "password": "ordinary-password",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("create ordinary user")?;
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+    let ordinary_cookie =
+        login_session_cookie(app.clone(), "ordinary-user", "ordinary-password").await?;
+
+    let anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/console/users")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .context("build malformed anonymous console request")?,
+        )
+        .await
+        .context("send malformed anonymous console request")?;
+    assert_error(
+        anonymous,
+        StatusCode::UNAUTHORIZED,
+        "authentication_required",
+    )
+    .await?;
+
+    let ordinary = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/console/users")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, ordinary_cookie)
+                .body(Body::from("{"))
+                .context("build malformed ordinary console request")?,
+        )
+        .await
+        .context("send malformed ordinary console request")?;
+    assert_error(ordinary, StatusCode::FORBIDDEN, "forbidden").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_validate_console_usernames_and_preserve_display_casing() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+
+    let long_username = "a".repeat(65);
+    for invalid_username in [
+        "",
+        "not allowed",
+        "slash/name",
+        "ümlaut",
+        long_username.as_str(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request_with_cookie(
+                "POST",
+                "/api/console/users",
+                serde_json::json!({
+                    "username": invalid_username,
+                    "password": "valid-password",
+                    "permissions": {
+                        "upload": false,
+                        "rename": false,
+                        "delete": false,
+                    },
+                }),
+                &admin_cookie,
+            )?)
+            .await
+            .context("send invalid username create request")?;
+        assert_error(response, StatusCode::BAD_REQUEST, "invalid_username").await?;
+    }
+
+    let create = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "Mixed_Case-1",
+                "password": "valid-password",
+                "permissions": {
+                    "upload": false,
+                    "rename": false,
+                    "delete": false,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send valid mixed-case username create request")?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let duplicate = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "mixed_case-1",
+                "password": "another-password",
+                "permissions": {
+                    "upload": false,
+                    "rename": false,
+                    "delete": false,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send duplicate username create request")?;
+    assert_error(duplicate, StatusCode::CONFLICT, "username_conflict").await?;
+
+    let list = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/console/users")
+                .header(header::COOKIE, &admin_cookie)
+                .body(Body::empty())
+                .context("build console list users request")?,
+        )
+        .await
+        .context("send console list users request")?;
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = response_json(list).await?;
+    assert_eq!(
+        body.pointer("/users/0/username"),
+        Some(&serde_json::Value::String("Mixed_Case-1".to_owned()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_validate_console_initial_password_length_without_composition_rules()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+
+    let short_password = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "short-password-user",
+                "password": "1234567",
+                "permissions": {
+                    "upload": false,
+                    "rename": false,
+                    "delete": false,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send short password create request")?;
+    assert_error(short_password, StatusCode::BAD_REQUEST, "invalid_password").await?;
+
+    let short_unicode_password = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "short-unicode-password-user",
+                "password": "密碼密碼密碼密",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send short Unicode password create request")?;
+    assert_error(
+        short_unicode_password,
+        StatusCode::BAD_REQUEST,
+        "invalid_password",
+    )
+    .await?;
+
+    let simple_password = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "simple-password-user",
+                "password": "aaaaaaaa",
+                "permissions": {
+                    "upload": false,
+                    "rename": false,
+                    "delete": false,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send simple password create request")?;
+    assert_eq!(simple_password.status(), StatusCode::CREATED);
+
+    let unicode_password = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "unicode-password-user",
+                "password": "密碼密碼密碼密碼",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send eight-character Unicode password create request")?;
+    assert_eq!(unicode_password.status(), StatusCode::CREATED);
+
+    let user_cookie = login_session_cookie(app, "simple-password-user", "aaaaaaaa").await?;
+    assert!(user_cookie.contains("fh_session="));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_default_new_users_to_no_write_permissions_and_edit_each_permission()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+
+    let create_user = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "permission-user",
+                "password": "permission-password",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send default-permission user create request")?;
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+    let created = response_json(create_user).await?;
+    assert_eq!(
+        created.pointer("/permissions/upload"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        created.pointer("/permissions/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        created.pointer("/permissions/delete"),
+        Some(&serde_json::Value::Bool(false))
+    );
+
+    let user_cookie =
+        login_session_cookie(app.clone(), "permission-user", "permission-password").await?;
+    let default_identity = identity_with_cookie(app.clone(), &user_cookie).await?;
+    assert_eq!(
+        default_identity.pointer("/actions/upload"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        default_identity.pointer("/actions/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        default_identity.pointer("/actions/delete"),
+        Some(&serde_json::Value::Bool(false))
+    );
+
+    let edited = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "PATCH",
+            "/api/console/users/permission-user/permissions",
+            serde_json::json!({
+                "upload": true,
+                "rename": false,
+                "delete": true,
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send permission edit request")?;
+    assert_eq!(edited.status(), StatusCode::OK);
+    let edited = response_json(edited).await?;
+    assert_eq!(
+        edited.pointer("/permissions/upload"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        edited.pointer("/permissions/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        edited.pointer("/permissions/delete"),
+        Some(&serde_json::Value::Bool(true))
+    );
+
+    let edited_identity = identity_with_cookie(app, &user_cookie).await?;
+    assert_eq!(
+        edited_identity.pointer("/actions/upload"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        edited_identity.pointer("/actions/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        edited_identity.pointer("/actions/delete"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_edit_anonymous_permissions_without_logged_in_users_inheriting_them()
+-> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+
+    let default_anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/console/anonymous-permissions")
+                .header(header::COOKIE, &admin_cookie)
+                .body(Body::empty())
+                .context("build get anonymous permissions request")?,
+        )
+        .await
+        .context("send get anonymous permissions request")?;
+    assert_eq!(default_anonymous.status(), StatusCode::OK);
+    let default_anonymous = response_json(default_anonymous).await?;
+    assert_eq!(
+        default_anonymous.pointer("/upload"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        default_anonymous.pointer("/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        default_anonymous.pointer("/delete"),
+        Some(&serde_json::Value::Bool(false))
+    );
+
+    let create_user = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "non-inheriting-user",
+                "password": "non-inherit-password",
+                "permissions": {
+                    "upload": false,
+                    "rename": false,
+                    "delete": false,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send no-permission user create request")?;
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+
+    let edited_anonymous = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "PATCH",
+            "/api/console/anonymous-permissions",
+            serde_json::json!({
+                "upload": true,
+                "rename": true,
+                "delete": false,
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send anonymous permission edit request")?;
+    assert_eq!(edited_anonymous.status(), StatusCode::OK);
+
+    let anonymous_identity = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/identity")
+                .body(Body::empty())
+                .context("build anonymous identity request")?,
+        )
+        .await
+        .context("send anonymous identity request")?;
+    assert_eq!(anonymous_identity.status(), StatusCode::OK);
+    let anonymous_identity = response_json(anonymous_identity).await?;
+    assert_eq!(
+        anonymous_identity.pointer("/actions/upload"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        anonymous_identity.pointer("/actions/rename"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert_eq!(
+        anonymous_identity.pointer("/actions/delete"),
+        Some(&serde_json::Value::Bool(false))
+    );
+
+    let user_cookie =
+        login_session_cookie(app.clone(), "non-inheriting-user", "non-inherit-password").await?;
+    let user_identity = identity_with_cookie(app, &user_cookie).await?;
+    assert_eq!(
+        user_identity.pointer("/actions/upload"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        user_identity.pointer("/actions/rename"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    assert_eq!(
+        user_identity.pointer("/actions/delete"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_revoke_user_sessions_when_admin_resets_password_or_deletes_user() -> Result<()>
+{
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+
+    let create_user = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "reset-delete-user",
+                "password": "original-password",
+                "permissions": {
+                    "upload": true,
+                    "rename": false,
+                    "delete": false,
+                },
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send reset/delete user create request")?;
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+
+    let old_cookie = login_session_cookie(app.clone(), "reset-delete-user", "original-password")
+        .await
+        .context("login before reset")?;
+    let reset = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users/reset-delete-user/password",
+            serde_json::json!({
+                "password": "replacement-password",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send password reset request")?;
+    assert_eq!(reset.status(), StatusCode::NO_CONTENT);
+
+    let old_identity = identity_with_cookie(app.clone(), &old_cookie).await?;
+    assert_eq!(
+        old_identity.pointer("/authenticated"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    let stale_login = app
+        .clone()
+        .oneshot(json_request(
+            "/api/login",
+            serde_json::json!({
+                "username": "reset-delete-user",
+                "password": "original-password",
+            }),
+        )?)
+        .await
+        .context("send stale password login request")?;
+    assert_eq!(stale_login.status(), StatusCode::UNAUTHORIZED);
+
+    let new_cookie =
+        login_session_cookie(app.clone(), "reset-delete-user", "replacement-password").await?;
+    let delete_user = console_request(
+        "DELETE",
+        "/api/console/users/reset-delete-user",
+        &admin_cookie,
+    )?;
+    let delete_user = app
+        .clone()
+        .oneshot(delete_user)
+        .await
+        .context("send delete user request")?;
+    assert_eq!(delete_user.status(), StatusCode::NO_CONTENT);
+
+    let deleted_identity = identity_with_cookie(app.clone(), &new_cookie).await?;
+    assert_eq!(
+        deleted_identity.pointer("/authenticated"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    let deleted_login = app
+        .oneshot(json_request(
+            "/api/login",
+            serde_json::json!({
+                "username": "reset-delete-user",
+                "password": "replacement-password",
+            }),
+        )?)
+        .await
+        .context("send deleted user login request")?;
+    assert_eq!(deleted_login.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
 async fn app_from_storage_root(storage_root: &Path) -> Result<axum::Router> {
     let config = config_from_storage_root(storage_root).await?;
     build_router(config).await.context("build app router")
