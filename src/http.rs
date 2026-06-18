@@ -108,6 +108,7 @@ pub async fn build_router_with_bootstrap_report(
         .route("/api/download", get(download_file))
         .route("/api/archive", get(download_directory_archive))
         .route("/api/mkdir", post(create_directory))
+        .route("/api/rename", post(rename_resource))
         .route(
             "/api/upload",
             post(upload_file).layer(DefaultBodyLimit::max(upload_body_limit)),
@@ -196,6 +197,13 @@ struct DownloadQuery {
 struct CreateDirectoryRequest {
     path: String,
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RenameResourceRequest {
+    path: String,
+    new_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,6 +591,20 @@ async fn create_directory(
     Ok(StatusCode::CREATED)
 }
 
+async fn rename_resource(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Result<StatusCode, ApiError> {
+    require_rename_permission(&state, request.headers()).await?;
+    let Json(request) = Json::<RenameResourceRequest>::from_request(request, &state)
+        .await
+        .map_err(|_| ApiError::invalid_rename_request())?;
+    resource::rename_resource(&state.config, &request.path, &request.new_name)
+        .await
+        .map_err(|error| ApiError::from_rename_error(error, &request.path))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn upload_file(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -726,16 +748,34 @@ async fn read_upload_path(field: &mut Field<'_>) -> Result<String, ApiError> {
 }
 
 async fn require_upload_permission(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let token = session_token_from_headers(headers);
-    let permissions = match state.auth.identity_for_session(token.as_deref()).await? {
-        Some(identity) => identity.permissions(),
-        None => state.auth.anonymous_permissions().await?,
-    };
+    let permissions = effective_permissions(state, headers).await?;
     if permissions.upload() {
         Ok(())
     } else {
         Err(ApiError::upload_permission_required())
     }
+}
+
+async fn require_rename_permission(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let permissions = effective_permissions(state, headers).await?;
+    if permissions.rename() {
+        Ok(())
+    } else {
+        Err(ApiError::rename_permission_required())
+    }
+}
+
+async fn effective_permissions(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<PermissionSet, ApiError> {
+    let token = session_token_from_headers(headers);
+    Ok(
+        match state.auth.identity_for_session(token.as_deref()).await? {
+            Some(identity) => identity.permissions(),
+            None => state.auth.anonymous_permissions().await?,
+        },
+    )
 }
 
 async fn download_file(
@@ -834,12 +874,10 @@ impl From<resource::ResourceError> for ApiError {
                 path: None,
                 reason: "resource path is not a file".to_owned(),
             },
-            resource::ResourceError::RootDirectoryArchive => Self {
-                status: StatusCode::BAD_REQUEST,
-                code: "root_directory_archive",
-                path: None,
-                reason: "Root Directory cannot be downloaded as an archive".to_owned(),
-            },
+            error @ (resource::ResourceError::RootDirectoryArchive
+            | resource::ResourceError::RootDirectoryRename) => {
+                Self::from_root_directory_error(&error)
+            }
             resource::ResourceError::ResourceNotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "resource_not_found",
@@ -881,6 +919,7 @@ impl From<resource::ResourceError> for ApiError {
             error @ (resource::ResourceError::InvalidWriteResourceName
             | resource::ResourceError::NameConflict
             | resource::ResourceError::CreateDirectory(_)
+            | resource::ResourceError::RenameResource(_)
             | resource::ResourceError::UploadSingleFileSizeLimitExceeded { .. }
             | resource::ResourceError::UploadTotalSizeLimitExceeded { .. }
             | resource::ResourceError::StoreUpload(_)) => Self::from_write_error(&error),
@@ -966,6 +1005,31 @@ impl From<&ManagedUser> for ManagedUserResponse {
 }
 
 impl ApiError {
+    fn from_root_directory_error(error: &resource::ResourceError) -> Self {
+        let (code, reason) = match error {
+            resource::ResourceError::RootDirectoryArchive => (
+                "root_directory_archive",
+                "Root Directory cannot be downloaded as an archive",
+            ),
+            resource::ResourceError::RootDirectoryRename => {
+                ("root_directory_rename", "Root Directory cannot be renamed")
+            }
+            _ => return Self::internal_server_error(),
+        };
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            path: None,
+            reason: reason.to_owned(),
+        }
+    }
+
+    fn from_rename_error(error: resource::ResourceError, path: &str) -> Self {
+        let mut error = Self::from(error);
+        error.path = Some(path.to_owned());
+        error
+    }
+
     fn invalid_resource_name() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1046,6 +1110,12 @@ impl ApiError {
                 path: None,
                 reason: "failed to create Directory".to_owned(),
             },
+            resource::ResourceError::RenameResource(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "rename_failed",
+                path: None,
+                reason: "failed to rename Resource".to_owned(),
+            },
             resource::ResourceError::UploadSingleFileSizeLimitExceeded { limit } => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 code: "upload_single_file_size_limit_exceeded",
@@ -1110,6 +1180,24 @@ impl ApiError {
             code: "upload_permission_required",
             path: None,
             reason: "Upload Permission is required".to_owned(),
+        }
+    }
+
+    fn rename_permission_required() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "rename_permission_required",
+            path: None,
+            reason: "Rename Permission is required".to_owned(),
+        }
+    }
+
+    fn invalid_rename_request() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_rename_request",
+            path: None,
+            reason: "Rename request is invalid".to_owned(),
         }
     }
 
@@ -1725,6 +1813,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
       </form>
     </dialog>
+    <dialog id="rename-resource-dialog">
+      <form id="rename-resource-form">
+        <h2>Rename resource</h2>
+        <label for="rename-resource-name">Resource name</label>
+        <input id="rename-resource-name" name="name" maxlength="255" required autocomplete="off">
+        <div class="dialog-actions">
+          <button type="button" id="cancel-rename-resource">Cancel</button>
+          <button type="submit" class="primary">Rename</button>
+        </div>
+      </form>
+    </dialog>
   </main>
   <script>
     (function () {
@@ -1748,6 +1847,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       var createDirectoryForm = document.getElementById('create-directory-form');
       var createDirectoryName = document.getElementById('create-directory-name');
       var cancelCreateDirectory = document.getElementById('cancel-create-directory');
+      var renameResourceDialog = document.getElementById('rename-resource-dialog');
+      var renameResourceForm = document.getElementById('rename-resource-form');
+      var renameResourceName = document.getElementById('rename-resource-name');
+      var cancelRenameResource = document.getElementById('cancel-rename-resource');
       var uploadProgress = document.getElementById('upload-progress');
       var sortButtons = Array.prototype.slice.call(document.querySelectorAll('[data-sort-field]'));
       var sortIndicators = Array.prototype.slice.call(document.querySelectorAll('[data-sort-indicator]'));
@@ -1756,7 +1859,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
         sort: 'name',
         order: 'asc',
         filter: '',
-        searchMode: 'currentListFilter'
+        searchMode: 'currentListFilter',
+        canRename: false,
+        currentRows: [],
+        searchRows: [],
+        searchTruncated: false,
+        showingServerSearch: false,
+        renameResource: null,
+        renameSource: null
       };
 
       function text(value) {
@@ -1795,7 +1905,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
             renderParentAction();
             renderSearchMode();
             renderSort(body.sort || { field: state.sort, order: state.order });
-            renderRows(body.resources || []);
+            state.currentRows = body.resources || [];
+            state.showingServerSearch = false;
+            renderRows(state.currentRows);
           })
           .catch(function (error) {
             renderError(error.message);
@@ -1814,7 +1926,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           .catch(function () {
             renderIdentity({
               authenticated: false,
-              actions: { login: true, passwordChange: false, logout: false, console: false, upload: false }
+              actions: { login: true, passwordChange: false, logout: false, console: false, upload: false, rename: false }
             });
           });
       }
@@ -1828,6 +1940,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
         uploadFileAction.hidden = !identity.actions.upload;
         uploadDirectoryAction.hidden = !identity.actions.upload;
         createDirectoryAction.hidden = !identity.actions.upload;
+        state.canRename = Boolean(identity.actions.rename);
+        if (state.showingServerSearch) {
+          renderSearchRows(state.searchRows, state.searchTruncated);
+        } else {
+          renderRows(state.currentRows);
+        }
       }
 
       function resetAfterWrite() {
@@ -1889,6 +2007,41 @@ const INDEX_HTML: &str = r#"<!doctype html>
           renderError('Upload failed');
         };
         request.send(form);
+      }
+
+      function submitRenameResource(event) {
+        event.preventDefault();
+        if (!state.renameResource) {
+          return;
+        }
+        fetch('/api/rename', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            path: state.renameResource.resourcePath,
+            newName: renameResourceName.value
+          })
+        }).then(function (response) {
+          if (response.ok) {
+            renameResourceDialog.close();
+            var renameSource = state.renameSource;
+            state.renameResource = null;
+            state.renameSource = null;
+            if (renameSource === 'serverSearch') {
+              runServerSearch();
+            } else {
+              resetAfterWrite();
+            }
+            return;
+          }
+          return response.json().then(function (body) {
+            var reason = body.error && body.error.reason ? body.error.reason : 'Rename failed';
+            var path = body.error && body.error.path ? body.error.path + ': ' : '';
+            throw new Error(path + reason);
+          });
+        }).catch(function (error) {
+          renderError(error.message);
+        });
       }
 
       function createDirectory() {
@@ -1986,6 +2139,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
         window.location.assign('/api/archive?path=' + encodeURIComponent(resourcePath));
       }
 
+      function appendRenameAction(actions, resource, source) {
+        if (!state.canRename) {
+          return;
+        }
+        var rename = document.createElement('button');
+        rename.type = 'button';
+        rename.setAttribute('aria-label', 'Rename ' + resource.name);
+        rename.appendChild(text('Rename'));
+        rename.addEventListener('click', function () {
+          state.renameResource = resource;
+          state.renameSource = source;
+          renameResourceName.value = resource.name;
+          renameResourceDialog.showModal();
+          renameResourceName.focus();
+          renameResourceName.select();
+        });
+        actions.appendChild(rename);
+      }
+
       function renderSearchMode() {
         serverSearchSubmit.hidden = state.searchMode !== 'serverSearch';
       }
@@ -2001,7 +2173,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
             });
           })
           .then(function (body) {
-            renderSearchRows(body.resources || [], Boolean(body.truncated));
+            state.searchRows = body.resources || [];
+            state.searchTruncated = Boolean(body.truncated);
+            state.showingServerSearch = true;
+            renderSearchRows(state.searchRows, state.searchTruncated);
           })
           .catch(function (error) {
             renderError(error.message);
@@ -2084,6 +2259,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             });
             actions.appendChild(archive);
           }
+          appendRenameAction(actions, resource, 'serverSearch');
           resultRow.appendChild(name);
           resultRow.appendChild(kind);
           resultRow.appendChild(size);
@@ -2144,6 +2320,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             });
             actions.appendChild(archive);
           }
+          appendRenameAction(actions, resource, 'directoryListing');
           row.appendChild(name);
           row.appendChild(kind);
           row.appendChild(size);
@@ -2188,8 +2365,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       });
       createDirectoryAction.addEventListener('click', createDirectory);
       createDirectoryForm.addEventListener('submit', submitCreateDirectory);
+      renameResourceForm.addEventListener('submit', submitRenameResource);
       cancelCreateDirectory.addEventListener('click', function () {
         createDirectoryDialog.close();
+      });
+      cancelRenameResource.addEventListener('click', function () {
+        renameResourceDialog.close();
       });
 
       searchMode.addEventListener('change', function () {
