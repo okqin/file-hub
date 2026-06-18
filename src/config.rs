@@ -35,6 +35,7 @@ pub struct ServerConfig {
 pub struct RuntimeLimits {
     upload_single_file_size_limit_bytes: NonZeroU64,
     upload_total_size_limit_bytes: NonZeroU64,
+    directory_upload_resource_count_limit: NonZeroUsize,
     listing_direct_child_limit: NonZeroUsize,
     archive_resource_count_limit: NonZeroUsize,
     archive_uncompressed_size_limit_bytes: NonZeroU64,
@@ -101,6 +102,8 @@ struct RawRuntimeLimits {
     upload_single_file_size_limit_bytes: u64,
     #[serde(default = "default_upload_total_size_limit_bytes")]
     upload_total_size_limit_bytes: u64,
+    #[serde(default = "default_directory_upload_resource_count_limit")]
+    directory_upload_resource_count_limit: usize,
     listing_direct_child_limit: usize,
     archive_resource_count_limit: usize,
     archive_uncompressed_size_limit_bytes: u64,
@@ -151,6 +154,13 @@ impl Validate for RawRuntimeLimits {
             self.upload_total_size_limit_bytes,
             1,
             1_099_511_627_776,
+        );
+        add_range_error(
+            &mut errors,
+            "directory_upload_resource_count_limit",
+            self.directory_upload_resource_count_limit,
+            1,
+            1_000_000,
         );
         add_range_error(
             &mut errors,
@@ -255,6 +265,10 @@ impl AppConfig {
                 raw.limits.upload_total_size_limit_bytes,
                 "limits.upload_total_size_limit_bytes",
             )?,
+            directory_upload_resource_count_limit: non_zero(
+                raw.limits.directory_upload_resource_count_limit,
+                "limits.directory_upload_resource_count_limit",
+            )?,
             listing_direct_child_limit: non_zero(
                 raw.limits.listing_direct_child_limit,
                 "limits.listing_direct_child_limit",
@@ -356,6 +370,12 @@ impl RuntimeLimits {
         self.upload_total_size_limit_bytes
     }
 
+    /// Return the maximum number of Resources in one Directory Upload.
+    #[must_use]
+    pub const fn directory_upload_resource_count_limit(self) -> NonZeroUsize {
+        self.directory_upload_resource_count_limit
+    }
+
     /// Return the maximum number of direct child resources in one listing.
     #[must_use]
     pub const fn listing_direct_child_limit(self) -> NonZeroUsize {
@@ -409,6 +429,10 @@ const fn default_upload_single_file_size_limit_bytes() -> u64 {
 
 const fn default_upload_total_size_limit_bytes() -> u64 {
     100 * 1024 * 1024
+}
+
+const fn default_directory_upload_resource_count_limit() -> usize {
+    10_000
 }
 
 fn non_zero(value: usize, field: &'static str) -> Result<NonZeroUsize, AppConfigError> {
