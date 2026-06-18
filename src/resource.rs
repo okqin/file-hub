@@ -1,5 +1,12 @@
 //! Storage-root-backed resource listing.
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+use std::os::fd::AsFd;
 use std::{
     cmp::Ordering,
     collections::HashSet,
@@ -890,29 +897,24 @@ impl StagedDirectoryUpload {
             .map_err(ResourceError::StoreUpload)?;
         let staging_name = self.staging_name.clone();
         task::spawn_blocking(move || {
-            match destination_directory.symlink_metadata(&destination_name) {
-                Ok(_) => {
-                    return Err(ResourceError::DirectoryUploadConflict {
+            rename_directory_noreplace(
+                &staging_directory,
+                &staging_name,
+                &destination_directory,
+                &destination_name,
+            )
+            .map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+                ) {
+                    ResourceError::DirectoryUploadConflict {
                         path: conflict_path,
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ResourceError::StoreUpload(error)),
-            }
-            staging_directory
-                .rename(staging_name, &destination_directory, destination_name)
-                .map_err(|error| {
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
-                    ) {
-                        ResourceError::DirectoryUploadConflict {
-                            path: conflict_path,
-                        }
-                    } else {
-                        ResourceError::StoreUpload(error)
                     }
-                })
+                } else {
+                    ResourceError::StoreUpload(error)
+                }
+            })
         })
         .await
         .map_err(blocking_task_error)??;
@@ -996,6 +998,48 @@ fn open_staging_directory(root: &Dir, name: &str) -> Result<Dir, ResourceError> 
         )));
     }
     root.open_dir(name).map_err(ResourceError::StoreUpload)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+fn rename_directory_noreplace(
+    source_directory: &Dir,
+    source_name: &str,
+    destination_directory: &Dir,
+    destination_name: &str,
+) -> Result<(), std::io::Error> {
+    rustix::fs::renameat_with(
+        source_directory.as_fd(),
+        source_name,
+        destination_directory.as_fd(),
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "redox",
+    target_vendor = "apple"
+)))]
+fn rename_directory_noreplace(
+    source_directory: &Dir,
+    source_name: &str,
+    destination_directory: &Dir,
+    destination_name: &str,
+) -> Result<(), std::io::Error> {
+    match destination_directory.symlink_metadata(destination_name) {
+        Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    source_directory.rename(source_name, destination_directory, destination_name)
 }
 
 fn blocking_task_error(error: task::JoinError) -> ResourceError {

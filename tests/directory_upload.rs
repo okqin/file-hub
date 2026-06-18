@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{convert::Infallible, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -10,6 +10,7 @@ use file_hub::{
     config::AppConfig,
     http::build_router,
 };
+use futures_util::stream;
 use tempfile::TempDir;
 use tokio::fs;
 use tower::ServiceExt;
@@ -141,6 +142,80 @@ async fn test_should_publish_only_one_of_two_concurrent_directory_uploads() -> R
     assert!(statuses.contains(&StatusCode::CONFLICT));
     let content = fs::read(storage_root.path().join("selected/file.txt")).await?;
     assert!(content == b"first" || content == b"second");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_directory_upload_path_traversal_without_staging_escape() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+    let failed_path = "selected/../escaped.txt";
+    let files = [(failed_path, b"escaped".as_slice())];
+
+    let response = directory_upload_request(app, "", &files).await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(body.pointer("/error/path"), Some(&failed_path.into()));
+    assert!(!storage_root.path().join("selected").exists());
+    assert!(!storage_root.path().join("escaped.txt").exists());
+    assert_staging_empty(storage_root.path()).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_reject_symlink_directory_upload_destination() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    symlink(outside.path(), storage_root.path().join("selected"))
+        .context("create destination symlink")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+    let files = [("selected/file.txt", b"content".as_slice())];
+
+    let response = directory_upload_request(app, "", &files).await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!outside.path().join("file.txt").exists());
+    assert_staging_empty(storage_root.path()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_clean_staged_directory_when_request_is_cancelled() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+    let (content_type, first, second) = delayed_multipart_directory();
+    let chunks = vec![(Duration::ZERO, first), (Duration::from_secs(30), second)];
+    let body_stream = stream::unfold(chunks.into_iter(), |mut chunks| async move {
+        let (delay, chunk) = chunks.next()?;
+        tokio::time::sleep(delay).await;
+        Some((Ok::<_, Infallible>(chunk), chunks))
+    });
+    let upload = tokio::spawn(async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/upload")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from_stream(body_stream))
+                .context("build cancellable Directory Upload request")?,
+        )
+        .await
+        .context("send cancellable Directory Upload request")
+    });
+
+    wait_for_staged_directory(storage_root.path()).await?;
+    upload.abort();
+    let _cancelled = upload.await;
+    wait_for_staging_empty(storage_root.path()).await?;
+    assert!(!storage_root.path().join("selected").exists());
     Ok(())
 }
 
@@ -490,4 +565,67 @@ fn multipart_directory(path: &str, files: &[(&str, &[u8])]) -> (String, Vec<u8>)
     }
     body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
     (format!("multipart/form-data; boundary={BOUNDARY}"), body)
+}
+
+fn delayed_multipart_directory() -> (String, Vec<u8>, Vec<u8>) {
+    const BOUNDARY: &str = "file-hub-delayed-directory-boundary";
+    let first = format!(
+        concat!(
+            "--{0}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n\r\n",
+            "--{0}\r\nContent-Disposition: form-data; name=\"relativePath\"\r\n\r\n",
+            "selected/file.txt\r\n",
+            "--{0}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file.txt\"\r\n",
+            "Content-Type: application/octet-stream\r\n\r\npartial",
+        ),
+        BOUNDARY,
+    )
+    .into_bytes();
+    let second = format!("-complete\r\n--{BOUNDARY}--\r\n").into_bytes();
+    (
+        format!("multipart/form-data; boundary={BOUNDARY}"),
+        first,
+        second,
+    )
+}
+
+async fn wait_for_staged_directory(storage_root: &Path) -> Result<()> {
+    let staging = storage_root.join(".fh-staging");
+    for _ in 0..50 {
+        if let Ok(mut entries) = fs::read_dir(&staging).await
+            && entries
+                .next_entry()
+                .await
+                .context("read staged Directory Upload entry")?
+                .is_some()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("Directory Upload did not enter reserved staging")
+}
+
+async fn wait_for_staging_empty(storage_root: &Path) -> Result<()> {
+    for _ in 0..50 {
+        if assert_staging_empty(storage_root).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("Directory Upload staging remnant was not removed")
+}
+
+async fn assert_staging_empty(storage_root: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(storage_root.join(".fh-staging"))
+        .await
+        .context("open staging directory")?;
+    anyhow::ensure!(
+        entries
+            .next_entry()
+            .await
+            .context("read staging directory")?
+            .is_none(),
+        "staging directory is not empty",
+    );
+    Ok(())
 }
