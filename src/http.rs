@@ -7,6 +7,7 @@ use axum::{
     body::Body,
     extract::{
         DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path as AxumPath, Query, State,
+        multipart::Field,
     },
     http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     response::{Html, IntoResponse, Response},
@@ -557,10 +558,12 @@ async fn list_root_directory(
 
 async fn create_directory(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<CreateDirectoryRequest>,
+    request: axum::extract::Request,
 ) -> Result<StatusCode, ApiError> {
-    require_upload_permission(&state, &headers).await?;
+    require_upload_permission(&state, request.headers()).await?;
+    let Json(request) = Json::<CreateDirectoryRequest>::from_request(request, &state)
+        .await
+        .map_err(|_| ApiError::invalid_create_directory_request())?;
     resource::create_directory(&state.config, &request.path, &request.name).await?;
     Ok(StatusCode::CREATED)
 }
@@ -589,10 +592,7 @@ async fn upload_file(
         };
         match field.name() {
             Some("path") if path.is_none() && staged_upload.is_none() => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|_| ApiError::invalid_upload_request())?;
+                let value = read_upload_path(&mut field).await?;
                 path = Some(value);
             }
             Some("file") if staged_upload.is_none() => {
@@ -635,6 +635,25 @@ async fn upload_file(
         .commit()
         .await?;
     Ok(StatusCode::CREATED)
+}
+
+async fn read_upload_path(field: &mut Field<'_>) -> Result<String, ApiError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|_| ApiError::invalid_upload_request())?
+    {
+        let next_length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(ApiError::invalid_upload_request)?;
+        if next_length > resource::MAX_RESOURCE_PATH_BYTES {
+            return Err(ApiError::invalid_upload_request());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| ApiError::invalid_upload_request())
 }
 
 async fn require_upload_permission(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -939,6 +958,14 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_upload_request",
             reason: "upload request is invalid".to_owned(),
+        }
+    }
+
+    fn invalid_create_directory_request() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_create_directory_request",
+            reason: "create Directory request is invalid".to_owned(),
         }
     }
 
@@ -1381,6 +1408,40 @@ const INDEX_HTML: &str = r#"<!doctype html>
       width: 160px;
       height: 12px;
     }
+    dialog {
+      width: min(420px, calc(100% - 28px));
+      padding: 20px;
+      border: 1px solid #8c959f;
+      border-radius: 6px;
+    }
+    dialog::backdrop {
+      background: rgb(0 0 0 / .35);
+    }
+    dialog form {
+      display: grid;
+      gap: 16px;
+    }
+    dialog h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .dialog-actions button {
+      min-height: 36px;
+      padding: 7px 12px;
+      border: 1px solid #8c959f;
+      border-radius: 4px;
+      background: #fff;
+    }
+    .dialog-actions button.primary {
+      border-color: #0969da;
+      background: #0969da;
+      color: #fff;
+    }
     .filter {
       display: flex;
       align-items: center;
@@ -1487,6 +1548,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </tbody>
       </table>
     </section>
+    <dialog id="create-directory-dialog">
+      <form id="create-directory-form">
+        <h2>Create directory</h2>
+        <label for="create-directory-name">Directory name</label>
+        <input id="create-directory-name" name="name" maxlength="255" required autocomplete="off">
+        <div class="dialog-actions">
+          <button type="button" id="cancel-create-directory">Cancel</button>
+          <button type="submit" class="primary">Create</button>
+        </div>
+      </form>
+    </dialog>
   </main>
   <script>
     (function () {
@@ -1504,6 +1576,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       var uploadFileAction = document.getElementById('upload-file-action');
       var uploadFileInput = document.getElementById('upload-file-input');
       var createDirectoryAction = document.getElementById('create-directory-action');
+      var createDirectoryDialog = document.getElementById('create-directory-dialog');
+      var createDirectoryForm = document.getElementById('create-directory-form');
+      var createDirectoryName = document.getElementById('create-directory-name');
+      var cancelCreateDirectory = document.getElementById('cancel-create-directory');
       var uploadProgress = document.getElementById('upload-progress');
       var sortButtons = Array.prototype.slice.call(document.querySelectorAll('[data-sort-field]'));
       var sortIndicators = Array.prototype.slice.call(document.querySelectorAll('[data-sort-indicator]'));
@@ -1629,16 +1705,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
 
       function createDirectory() {
-        var name = window.prompt('Directory name');
-        if (name == null) {
-          return;
-        }
+        createDirectoryForm.reset();
+        createDirectoryDialog.showModal();
+        createDirectoryName.focus();
+      }
+
+      function submitCreateDirectory(event) {
+        event.preventDefault();
         fetch('/api/mkdir', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ path: state.path, name: name })
+          body: JSON.stringify({ path: state.path, name: createDirectoryName.value })
         }).then(function (response) {
           if (response.ok) {
+            createDirectoryDialog.close();
             resetAfterWrite();
             return;
           }
@@ -1912,6 +1992,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
         }
       });
       createDirectoryAction.addEventListener('click', createDirectory);
+      createDirectoryForm.addEventListener('submit', submitCreateDirectory);
+      cancelCreateDirectory.addEventListener('click', function () {
+        createDirectoryDialog.close();
+      });
 
       searchMode.addEventListener('change', function () {
         state.searchMode = searchMode.value;

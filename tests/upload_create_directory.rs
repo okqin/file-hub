@@ -76,6 +76,7 @@ async fn test_should_deny_direct_create_requests_without_upload_permission() -> 
     assert_error(mkdir, StatusCode::FORBIDDEN, "upload_permission_required").await?;
 
     let upload = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -87,6 +88,24 @@ async fn test_should_deny_direct_create_requests_without_upload_permission() -> 
         .await
         .context("send direct upload request")?;
     assert_error(upload, StatusCode::FORBIDDEN, "upload_permission_required").await?;
+
+    let malformed_mkdir = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mkdir")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("not-json"))
+                .context("build malformed create Directory request")?,
+        )
+        .await
+        .context("send malformed create Directory request")?;
+    assert_error(
+        malformed_mkdir,
+        StatusCode::FORBIDDEN,
+        "upload_permission_required",
+    )
+    .await?;
     Ok(())
 }
 
@@ -158,11 +177,14 @@ async fn test_should_render_upload_actions_progress_and_listing_refresh_behavior
 
     assert!(body.contains("id=\"upload-file-action\" hidden"));
     assert!(body.contains("id=\"create-directory-action\" hidden"));
+    assert!(body.contains("id=\"create-directory-dialog\""));
+    assert!(body.contains("id=\"create-directory-form\""));
     assert!(body.contains("id=\"upload-progress\""));
     assert!(body.contains("new XMLHttpRequest()"));
     assert!(body.contains("request.upload.onprogress"));
     assert!(body.contains("uploadFileAction.hidden = !identity.actions.upload"));
     assert!(body.contains("createDirectoryAction.hidden = !identity.actions.upload"));
+    assert!(body.contains("createDirectoryDialog.showModal()"));
     assert!(body.contains("state.filter = ''"));
     assert!(body.contains("state.searchMode = 'currentListFilter'"));
     assert!(body.contains("loadDirectory(state.path)"));
@@ -305,6 +327,7 @@ async fn test_should_reject_invalid_resource_names_for_file_upload() -> Result<(
         "..".to_owned(),
         "nested/name".to_owned(),
         "nested\\name".to_owned(),
+        "nul\0name".to_owned(),
         "control\nname".to_owned(),
         ".fh-staging".to_owned(),
         "x".repeat(256),
@@ -314,6 +337,28 @@ async fn test_should_reject_invalid_resource_names_for_file_upload() -> Result<(
         let response = upload_request(app.clone(), &name, b"content").await?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_reject_oversized_upload_path_without_staging() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+    let (content_type, body) = multipart_file(&"x".repeat(4097), "safe.txt", b"content");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/upload")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .context("build oversized Resource Path upload")?,
+        )
+        .await
+        .context("send oversized Resource Path upload")?;
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_upload_request").await?;
+    assert!(!storage_root.path().join(".fh-staging").exists());
     Ok(())
 }
 
@@ -434,6 +479,90 @@ async fn test_should_enforce_authenticated_users_own_upload_permission() -> Resu
         .await
         .context("send allowed authenticated create request")?;
     assert_eq!(allowed.status(), StatusCode::CREATED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_allow_only_one_concurrent_upload_for_the_same_name() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+
+    let (first, second) = tokio::join!(
+        upload_request(app.clone(), "same.txt", b"first"),
+        upload_request(app, "same.txt", b"second"),
+    );
+    let statuses = [first?.status(), second?.status()];
+    assert!(statuses.contains(&StatusCode::CREATED));
+    assert!(statuses.contains(&StatusCode::CONFLICT));
+    let content = fs::read(storage_root.path().join("same.txt"))
+        .await
+        .context("read winning concurrent upload")?;
+    assert!(content == b"first" || content == b"second");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_clean_staging_when_upload_request_is_cancelled() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+    let (content_type, first, second) = delayed_multipart_file("cancelled.txt");
+    let chunks = vec![(Duration::ZERO, first), (Duration::from_secs(30), second)];
+    let body_stream = stream::unfold(chunks.into_iter(), |mut chunks| async move {
+        let (delay, chunk) = chunks.next()?;
+        tokio::time::sleep(delay).await;
+        Some((Ok::<_, Infallible>(chunk), chunks))
+    });
+    let upload = tokio::spawn(async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/upload")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from_stream(body_stream))
+                .context("build cancellable upload request")?,
+        )
+        .await
+        .context("send cancellable upload request")
+    });
+
+    wait_for_staged_file(storage_root.path()).await?;
+    upload.abort();
+    let _cancelled = upload.await;
+    wait_for_staging_empty(storage_root.path()).await?;
+    assert!(!storage_root.path().join("cancelled.txt").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_reject_symlink_write_paths_and_staging_directory() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    symlink(outside.path(), storage_root.path().join("linked"))
+        .context("create Resource Path symlink")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+
+    let mkdir = app
+        .clone()
+        .oneshot(json_request(
+            "/api/mkdir",
+            &serde_json::json!({ "path": "linked", "name": "escaped" }),
+        )?)
+        .await
+        .context("send symlink create Directory request")?;
+    assert_error(mkdir, StatusCode::BAD_REQUEST, "not_directory").await?;
+    assert!(!outside.path().join("escaped").exists());
+
+    symlink(outside.path(), storage_root.path().join(".fh-staging"))
+        .context("create staging symlink")?;
+    let upload = upload_request(app, "safe.txt", b"content").await?;
+    assert_error(upload, StatusCode::INTERNAL_SERVER_ERROR, "upload_failed").await?;
+    assert!(!outside.path().join("safe.txt").exists());
     Ok(())
 }
 
@@ -595,4 +724,23 @@ async fn wait_for_staged_file(storage_root: &Path) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     anyhow::bail!("upload did not enter reserved staging")
+}
+
+async fn wait_for_staging_empty(storage_root: &Path) -> Result<()> {
+    let staging = storage_root.join(".fh-staging");
+    for _ in 0..50 {
+        let mut entries = fs::read_dir(&staging)
+            .await
+            .context("open staging directory")?;
+        if entries
+            .next_entry()
+            .await
+            .context("read staging directory")?
+            .is_none()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("cancelled upload staging file was not removed")
 }
