@@ -178,6 +178,9 @@ pub enum ResourceError {
     /// The Root Directory cannot be downloaded as an archive.
     #[error("root directory cannot be downloaded as an archive")]
     RootDirectoryArchive,
+    /// The Root Directory cannot be renamed.
+    #[error("root directory cannot be renamed")]
+    RootDirectoryRename,
     /// The requested resource path does not exist.
     #[error("resource path does not exist")]
     ResourceNotFound,
@@ -274,6 +277,9 @@ pub enum ResourceError {
     /// A Directory Resource could not be created.
     #[error("failed to create directory resource")]
     CreateDirectory(#[source] std::io::Error),
+    /// A File or Directory Resource could not be renamed.
+    #[error("failed to rename resource")]
+    RenameResource(#[source] std::io::Error),
     /// One uploaded File exceeded the configured byte limit.
     #[error("uploaded file exceeds configured size limit of {limit} bytes")]
     UploadSingleFileSizeLimitExceeded {
@@ -448,6 +454,61 @@ pub async fn create_directory(
     })
     .await
     .map_err(blocking_task_error)??;
+    Ok(())
+}
+
+/// Rename a File or Directory Resource within its containing Directory.
+///
+/// # Errors
+///
+/// Returns an error when the Resource Path or new Resource Name is invalid, the source is not a
+/// regular File or Directory, the destination already exists, or the atomic rename fails.
+pub async fn rename_resource(
+    config: &AppConfig,
+    path: &str,
+    new_name: &str,
+) -> Result<(), ResourceError> {
+    let resource_path = ResourcePath::parse(path)?;
+    if resource_path.contains_reserved_name(config.staging_directory_name()) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+    if !is_valid_resource_name(new_name) || new_name == config.staging_directory_name() {
+        return Err(ResourceError::InvalidWriteResourceName);
+    }
+    let Some((source_name, parent_segments)) = resource_path.segments.split_last() else {
+        return Err(ResourceError::RootDirectoryRename);
+    };
+
+    let storage_root = config.storage_root().to_path_buf();
+    let parent_segments = parent_segments
+        .iter()
+        .map(|segment| (*segment).to_owned())
+        .collect::<Vec<_>>();
+    let source_name = (*source_name).to_owned();
+    let new_name = new_name.to_owned();
+    task::spawn_blocking(move || {
+        let root = Dir::open_ambient_dir(storage_root, ambient_authority())
+            .map_err(ResourceError::RenameResource)?;
+        let parent = open_relative_directory(&root, &parent_segments)?;
+        let metadata = parent
+            .symlink_metadata(&source_name)
+            .map_err(map_resolve_error)?;
+        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(ResourceError::InvalidResourcePath);
+        }
+        match rename_noreplace(&parent, &source_name, &parent, &new_name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ResourceError::NameConflict)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(ResourceError::ResourceNotFound)
+            }
+            Err(error) => Err(ResourceError::RenameResource(error)),
+        }
+    })
+    .await
+    .map_err(|error| ResourceError::RenameResource(std::io::Error::other(error)))??;
     Ok(())
 }
 
@@ -897,7 +958,7 @@ impl StagedDirectoryUpload {
             .map_err(ResourceError::StoreUpload)?;
         let staging_name = self.staging_name.clone();
         task::spawn_blocking(move || {
-            rename_directory_noreplace(
+            rename_noreplace(
                 &staging_directory,
                 &staging_name,
                 &destination_directory,
@@ -1006,7 +1067,7 @@ fn open_staging_directory(root: &Dir, name: &str) -> Result<Dir, ResourceError> 
     target_os = "redox",
     target_vendor = "apple"
 ))]
-fn rename_directory_noreplace(
+fn rename_noreplace(
     source_directory: &Dir,
     source_name: &str,
     destination_directory: &Dir,
@@ -1028,7 +1089,7 @@ fn rename_directory_noreplace(
     target_os = "redox",
     target_vendor = "apple"
 )))]
-fn rename_directory_noreplace(
+fn rename_noreplace(
     source_directory: &Dir,
     source_name: &str,
     destination_directory: &Dir,
