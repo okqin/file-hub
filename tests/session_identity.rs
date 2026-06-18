@@ -751,6 +751,75 @@ async fn test_should_allow_only_administrator_to_access_console_api_and_view() -
     assert!(body.contains("aria-label=\"Console\""));
     assert!(body.contains("id=\"create-user-action\""));
     assert!(body.contains("id=\"anonymous-upload-permission\""));
+    assert!(body.contains("/api/console/users/${encodeURIComponent(username)}/permissions"));
+    assert!(body.contains("Reset password"));
+    assert!(body.contains("loadConsole().catch"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_authorize_console_requests_before_parsing_json_bodies() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config = config_from_storage_root(storage_root.path()).await?;
+    let built = build_router_with_bootstrap_report(config)
+        .await
+        .context("build router with bootstrap report")?;
+    let password = built
+        .bootstrap_password()
+        .context("first startup should report bootstrap password")?
+        .plaintext_password()
+        .to_owned();
+    let app = built.into_router();
+    let admin_cookie = login_session_cookie(app.clone(), "admin", &password).await?;
+    let create_user = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "ordinary-user",
+                "password": "ordinary-password",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("create ordinary user")?;
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+    let ordinary_cookie =
+        login_session_cookie(app.clone(), "ordinary-user", "ordinary-password").await?;
+
+    let anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/console/users")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .context("build malformed anonymous console request")?,
+        )
+        .await
+        .context("send malformed anonymous console request")?;
+    assert_error(
+        anonymous,
+        StatusCode::UNAUTHORIZED,
+        "authentication_required",
+    )
+    .await?;
+
+    let ordinary = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/console/users")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, ordinary_cookie)
+                .body(Body::from("{"))
+                .context("build malformed ordinary console request")?,
+        )
+        .await
+        .context("send malformed ordinary console request")?;
+    assert_error(ordinary, StatusCode::FORBIDDEN, "forbidden").await?;
     Ok(())
 }
 
@@ -893,6 +962,26 @@ async fn test_should_validate_console_initial_password_length_without_compositio
         .context("send short password create request")?;
     assert_error(short_password, StatusCode::BAD_REQUEST, "invalid_password").await?;
 
+    let short_unicode_password = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "short-unicode-password-user",
+                "password": "密碼密碼密碼密",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send short Unicode password create request")?;
+    assert_error(
+        short_unicode_password,
+        StatusCode::BAD_REQUEST,
+        "invalid_password",
+    )
+    .await?;
+
     let simple_password = app
         .clone()
         .oneshot(json_request_with_cookie(
@@ -912,6 +1001,21 @@ async fn test_should_validate_console_initial_password_length_without_compositio
         .await
         .context("send simple password create request")?;
     assert_eq!(simple_password.status(), StatusCode::CREATED);
+
+    let unicode_password = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/api/console/users",
+            serde_json::json!({
+                "username": "unicode-password-user",
+                "password": "密碼密碼密碼密碼",
+            }),
+            &admin_cookie,
+        )?)
+        .await
+        .context("send eight-character Unicode password create request")?;
+    assert_eq!(unicode_password.status(), StatusCode::CREATED);
 
     let user_cookie = login_session_cookie(app, "simple-password-user", "aaaaaaaa").await?;
     assert!(user_cookie.contains("fh_session="));

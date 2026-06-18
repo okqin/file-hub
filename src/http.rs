@@ -5,8 +5,8 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{FromRequestParts, Path as AxumPath, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
@@ -136,6 +136,21 @@ impl RouterWithBootstrapReport {
 struct AppState {
     config: Arc<AppConfig>,
     auth: AuthState,
+}
+
+#[derive(Debug)]
+struct Administrator;
+
+impl FromRequestParts<AppState> for Administrator {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require_admin(state, &parts.headers).await?;
+        Ok(Self)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,19 +366,14 @@ async fn change_password(
     Ok(response)
 }
 
-async fn console_view(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Html<&'static str>, ApiError> {
-    require_admin(&state, &headers).await?;
+async fn console_view(_administrator: Administrator) -> Result<Html<&'static str>, ApiError> {
     Ok(Html(CONSOLE_HTML))
 }
 
 async fn console_list_users(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
 ) -> Result<Json<ConsoleUsersResponse>, ApiError> {
-    require_admin(&state, &headers).await?;
     let users = state
         .auth
         .list_users()
@@ -380,10 +390,9 @@ async fn console_list_users(
 
 async fn console_create_user(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
     Json(request): Json<ConsoleUserRequest>,
 ) -> Result<Response, ApiError> {
-    require_admin(&state, &headers).await?;
     reject_administrator_target(&request.username)?;
     let permissions = request
         .permissions
@@ -405,10 +414,9 @@ async fn console_create_user(
 
 async fn console_delete_user(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
     AxumPath(username): AxumPath<String>,
 ) -> Result<Response, ApiError> {
-    require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
     state.auth.delete_user(&username).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -416,11 +424,10 @@ async fn console_delete_user(
 
 async fn console_rename_user(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
     AxumPath(username): AxumPath<String>,
     Json(request): Json<ConsoleRenameUserRequest>,
 ) -> Result<Response, ApiError> {
-    require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
     reject_administrator_target(&request.username)?;
     let user = state.auth.rename_user(&username, &request.username).await?;
@@ -429,11 +436,10 @@ async fn console_rename_user(
 
 async fn console_replace_user(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
     AxumPath(username): AxumPath<String>,
     Json(request): Json<ConsoleUserRequest>,
 ) -> Result<Response, ApiError> {
-    require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
     reject_administrator_target(&request.username)?;
     let permissions = request
@@ -449,11 +455,10 @@ async fn console_replace_user(
 
 async fn console_update_user_permissions(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
     AxumPath(username): AxumPath<String>,
     Json(request): Json<PermissionSetBody>,
 ) -> Result<Response, ApiError> {
-    require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
     let user = state
         .auth
@@ -464,11 +469,10 @@ async fn console_update_user_permissions(
 
 async fn console_reset_user_password(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
     AxumPath(username): AxumPath<String>,
     Json(request): Json<ConsolePasswordRequest>,
 ) -> Result<Response, ApiError> {
-    require_admin(&state, &headers).await?;
     reject_administrator_target(&username)?;
     state
         .auth
@@ -479,9 +483,8 @@ async fn console_reset_user_password(
 
 async fn console_get_anonymous_permissions(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
 ) -> Result<Json<PermissionSetBody>, ApiError> {
-    require_admin(&state, &headers).await?;
     Ok(Json(PermissionSetBody::from(
         state.auth.anonymous_permissions().await?,
     )))
@@ -489,10 +492,9 @@ async fn console_get_anonymous_permissions(
 
 async fn console_update_anonymous_permissions(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _administrator: Administrator,
     Json(request): Json<PermissionSetBody>,
 ) -> Result<Json<PermissionSetBody>, ApiError> {
-    require_admin(&state, &headers).await?;
     let permissions = state
         .auth
         .set_anonymous_permissions(PermissionSet::from(request))
@@ -876,39 +878,256 @@ const CONSOLE_HTML: &str = r#"<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>File Hub Console</title>
+  <style>
+    :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; color: #202124; background: #f5f6f7; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { display: flex; align-items: center; justify-content: space-between; min-height: 56px; padding: 0 24px; background: #fff; border-bottom: 1px solid #d9dde3; }
+    header h1 { margin: 0; font-size: 18px; }
+    header a { color: #1769aa; text-decoration: none; }
+    main { width: min(1100px, 100%); margin: 0 auto; padding: 24px; }
+    section { margin-bottom: 28px; }
+    h2 { margin: 0 0 12px; font-size: 16px; }
+    form, .anonymous-permissions { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; padding: 16px; background: #fff; border: 1px solid #d9dde3; border-radius: 6px; }
+    label { display: grid; gap: 6px; font-size: 13px; }
+    .permission { display: flex; align-items: center; gap: 6px; min-height: 36px; }
+    input[type="text"], input[type="password"] { width: 210px; min-height: 36px; padding: 7px 9px; border: 1px solid #aeb4bd; border-radius: 4px; font: inherit; }
+    button { min-height: 36px; padding: 7px 12px; border: 1px solid #8b929c; border-radius: 4px; background: #fff; color: inherit; font: inherit; cursor: pointer; }
+    button.primary { border-color: #1769aa; background: #1769aa; color: #fff; }
+    button.danger { border-color: #b3261e; color: #b3261e; }
+    button:disabled { cursor: wait; opacity: .6; }
+    dialog { width: min(420px, calc(100% - 28px)); padding: 20px; border: 1px solid #aeb4bd; border-radius: 6px; }
+    dialog::backdrop { background: rgb(0 0 0 / .35); }
+    dialog form { padding: 0; border: 0; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; width: 100%; }
+    .table-wrap { overflow-x: auto; background: #fff; border: 1px solid #d9dde3; border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid #e3e6ea; text-align: left; white-space: nowrap; }
+    th { font-size: 12px; color: #5f6368; background: #fafbfc; }
+    tbody tr:last-child td { border-bottom: 0; }
+    td.actions { display: flex; gap: 8px; }
+    #console-status { min-height: 22px; margin: 0 0 12px; color: #5f6368; }
+    #console-status.error { color: #b3261e; }
+    .empty { color: #5f6368; text-align: center; }
+    @media (max-width: 640px) { header, main { padding-left: 14px; padding-right: 14px; } input[type="text"], input[type="password"] { width: 100%; } form { align-items: stretch; } form > label { flex: 1 1 100%; } }
+  </style>
 </head>
 <body>
+  <header><h1>File Hub Console</h1><a href="/">Back to files</a></header>
   <main aria-label="Console">
-    <h1>Console</h1>
+    <p id="console-status" role="status" aria-live="polite"></p>
     <section aria-label="User Management">
+      <h2>Users</h2>
       <form id="create-user-form">
-        <input id="console-username" name="username" autocomplete="off">
-        <input id="console-password" name="password" type="password">
+        <label>Username <input id="console-username" name="username" type="text" autocomplete="off" maxlength="64" required pattern="[A-Za-z0-9_-]{1,64}"></label>
+        <label>Initial password <input id="console-password" name="password" type="password" minlength="8" maxlength="256" required></label>
         <label><input id="console-upload-permission" name="upload" type="checkbox"> Upload Permission</label>
         <label><input id="console-rename-permission" name="rename" type="checkbox"> Rename Permission</label>
         <label><input id="console-delete-permission" name="delete" type="checkbox"> Delete Permission</label>
-        <button type="submit" id="create-user-action">Create User</button>
+        <button class="primary" type="submit" id="create-user-action">Create User</button>
       </form>
-      <table>
-        <thead>
-          <tr>
-            <th>Username</th>
-            <th>Upload</th>
-            <th>Rename</th>
-            <th>Delete</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="console-users"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Username</th><th>Upload</th><th>Rename</th><th>Delete</th><th>Actions</th></tr></thead>
+          <tbody id="console-users"></tbody>
+        </table>
+      </div>
     </section>
     <section aria-label="Default Anonymous Permission Set">
-      <label><input id="anonymous-upload-permission" type="checkbox"> Upload Permission</label>
-      <label><input id="anonymous-rename-permission" type="checkbox"> Rename Permission</label>
-      <label><input id="anonymous-delete-permission" type="checkbox"> Delete Permission</label>
-      <button type="button" id="save-anonymous-permissions">Save Anonymous Permissions</button>
+      <h2>Anonymous permissions</h2>
+      <div class="anonymous-permissions">
+        <label class="permission"><input id="anonymous-upload-permission" type="checkbox"> Upload Permission</label>
+        <label class="permission"><input id="anonymous-rename-permission" type="checkbox"> Rename Permission</label>
+        <label class="permission"><input id="anonymous-delete-permission" type="checkbox"> Delete Permission</label>
+        <button class="primary" type="button" id="save-anonymous-permissions">Save</button>
+      </div>
     </section>
+    <dialog id="reset-password-dialog">
+      <form id="reset-password-form">
+        <h2>Reset password</h2>
+        <label>New password <input id="reset-password-value" name="password" type="password" minlength="8" maxlength="256" required></label>
+        <div class="dialog-actions">
+          <button type="button" id="cancel-password-reset">Cancel</button>
+          <button class="primary" type="submit">Reset password</button>
+        </div>
+      </form>
+    </dialog>
   </main>
+  <script>
+    const statusArea = document.querySelector('#console-status');
+    const usersBody = document.querySelector('#console-users');
+
+    function setStatus(message, isError = false) {
+      statusArea.textContent = message;
+      statusArea.classList.toggle('error', isError);
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error?.reason ?? `Request failed (${response.status})`);
+      }
+      return response.status === 204 ? null : response.json();
+    }
+
+    function permissionCheckbox(username, permission, checked) {
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = checked;
+      input.setAttribute('aria-label', `${username} ${permission} permission`);
+      input.addEventListener('change', async () => {
+        input.disabled = true;
+        try {
+          const row = input.closest('tr');
+          const permissions = Object.fromEntries(
+            [...row.querySelectorAll('input[type="checkbox"]')].map(item => [item.dataset.permission, item.checked]),
+          );
+          await api(`/api/console/users/${encodeURIComponent(username)}/permissions`, {
+            method: 'PATCH', body: JSON.stringify(permissions),
+          });
+          setStatus(`Updated permissions for ${username}.`);
+        } catch (error) {
+          input.checked = !input.checked;
+          setStatus(error.message, true);
+        } finally {
+          input.disabled = false;
+        }
+      });
+      input.dataset.permission = permission;
+      return input;
+    }
+
+    function actionButton(label, className, action) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      if (className) button.className = className;
+      button.addEventListener('click', action);
+      return button;
+    }
+
+    function renderUsers(users) {
+      usersBody.replaceChildren();
+      if (users.length === 0) {
+        const cell = document.createElement('td');
+        cell.colSpan = 5;
+        cell.className = 'empty';
+        cell.textContent = 'No ordinary users';
+        const row = document.createElement('tr');
+        row.append(cell);
+        usersBody.append(row);
+        return;
+      }
+      for (const user of users) {
+        const row = document.createElement('tr');
+        const username = document.createElement('td');
+        username.textContent = user.username;
+        row.append(username);
+        for (const permission of ['upload', 'rename', 'delete']) {
+          const cell = document.createElement('td');
+          cell.append(permissionCheckbox(user.username, permission, user.permissions[permission]));
+          row.append(cell);
+        }
+        const actions = document.createElement('td');
+        actions.className = 'actions';
+        actions.append(
+          actionButton('Rename', '', async () => {
+            const nextName = window.prompt('New username', user.username);
+            if (!nextName || nextName === user.username) return;
+            try {
+              await api(`/api/console/users/${encodeURIComponent(user.username)}`, {
+                method: 'PATCH', body: JSON.stringify({ username: nextName }),
+              });
+              await loadConsole();
+              setStatus(`Renamed ${user.username} to ${nextName}.`);
+            } catch (error) { setStatus(error.message, true); }
+          }),
+          actionButton('Reset password', '', () => {
+            const dialog = document.querySelector('#reset-password-dialog');
+            dialog.dataset.username = user.username;
+            document.querySelector('#reset-password-value').value = '';
+            dialog.showModal();
+          }),
+          actionButton('Delete', 'danger', async () => {
+            if (!window.confirm(`Delete ${user.username} and revoke all sessions?`)) return;
+            try {
+              await api(`/api/console/users/${encodeURIComponent(user.username)}`, { method: 'DELETE' });
+              await loadConsole();
+              setStatus(`Deleted ${user.username}.`);
+            } catch (error) { setStatus(error.message, true); }
+          }),
+        );
+        row.append(actions);
+        usersBody.append(row);
+      }
+    }
+
+    async function loadConsole() {
+      const data = await api('/api/console/users');
+      renderUsers(data.users);
+      for (const permission of ['upload', 'rename', 'delete']) {
+        document.querySelector(`#anonymous-${permission}-permission`).checked = data.anonymousPermissions[permission];
+      }
+    }
+
+    document.querySelector('#create-user-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const submit = document.querySelector('#create-user-action');
+      submit.disabled = true;
+      try {
+        const permissions = Object.fromEntries(
+          ['upload', 'rename', 'delete'].map(permission => [permission, form.elements[permission].checked]),
+        );
+        await api('/api/console/users', {
+          method: 'POST',
+          body: JSON.stringify({ username: form.elements.username.value, password: form.elements.password.value, permissions }),
+        });
+        const username = form.elements.username.value;
+        form.reset();
+        await loadConsole();
+        setStatus(`Created ${username}.`);
+      } catch (error) { setStatus(error.message, true); }
+      finally { submit.disabled = false; }
+    });
+
+    document.querySelector('#save-anonymous-permissions').addEventListener('click', async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const permissions = Object.fromEntries(
+          ['upload', 'rename', 'delete'].map(permission => [permission, document.querySelector(`#anonymous-${permission}-permission`).checked]),
+        );
+        await api('/api/console/anonymous-permissions', { method: 'PATCH', body: JSON.stringify(permissions) });
+        setStatus('Updated anonymous permissions.');
+      } catch (error) { setStatus(error.message, true); }
+      finally { button.disabled = false; }
+    });
+
+    document.querySelector('#cancel-password-reset').addEventListener('click', () => {
+      document.querySelector('#reset-password-dialog').close();
+    });
+
+    document.querySelector('#reset-password-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const dialog = document.querySelector('#reset-password-dialog');
+      const username = dialog.dataset.username;
+      const password = event.currentTarget.elements.password.value;
+      try {
+        await api(`/api/console/users/${encodeURIComponent(username)}/password`, {
+          method: 'POST', body: JSON.stringify({ password }),
+        });
+        dialog.close();
+        setStatus(`Reset password and revoked sessions for ${username}.`);
+      } catch (error) { setStatus(error.message, true); }
+    });
+
+    loadConsole().catch(error => setStatus(error.message, true));
+  </script>
 </body>
 </html>"#;
 

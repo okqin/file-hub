@@ -170,10 +170,6 @@ impl AuthState {
         if !is_valid_password(password) {
             return Err(AuthError::InvalidPassword);
         }
-        if self.user_exists(&username_normalized).await? {
-            return Err(AuthError::UsernameConflict);
-        }
-
         let password_hash = hash_password(password.to_owned()).await?;
         sqlx::query(
             "INSERT INTO users (username, username_normalized, password_hash, is_admin, \
@@ -187,7 +183,8 @@ impl AuthState {
         .bind(permissions.rename_as_i64())
         .bind(permissions.delete_as_i64())
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(map_user_write_error)?;
 
         Ok(())
     }
@@ -271,7 +268,8 @@ impl AuthState {
         .bind(&new_username_normalized)
         .bind(username_normalized)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(map_user_write_error)?;
         if result.rows_affected() == 0 {
             return Err(AuthError::UserNotFound);
         }
@@ -316,6 +314,7 @@ impl AuthState {
         };
 
         let password_hash = hash_password(password.to_owned()).await?;
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "UPDATE users SET username = ?, username_normalized = ?, password_hash = ?, \
              can_upload = ?, can_rename = ?, can_delete = ? WHERE id = ?",
@@ -327,12 +326,14 @@ impl AuthState {
         .bind(permissions.rename_as_i64())
         .bind(permissions.delete_as_i64())
         .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_user_write_error)?;
         sqlx::query("DELETE FROM sessions WHERE user_id = ?")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
 
         self.managed_user(&new_username_normalized).await
     }
@@ -363,15 +364,17 @@ impl AuthState {
             return Err(AuthError::UserNotFound);
         };
 
+        let mut transaction = self.pool.begin().await?;
         sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
             .bind(password_hash)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query("DELETE FROM sessions WHERE user_id = ?")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -392,14 +395,16 @@ impl AuthState {
             return Err(AuthError::UserNotFound);
         };
 
+        let mut transaction = self.pool.begin().await?;
         sqlx::query("DELETE FROM sessions WHERE user_id = ?")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -982,7 +987,16 @@ fn ordinary_user_target(username: &str) -> Result<String, AuthError> {
 }
 
 fn is_valid_password(password: &str) -> bool {
-    (MIN_PASSWORD_BYTES..=MAX_PASSWORD_BYTES).contains(&password.len())
+    password.len() <= MAX_PASSWORD_BYTES && password.chars().count() >= MIN_PASSWORD_BYTES
+}
+
+fn map_user_write_error(error: sqlx::Error) -> AuthError {
+    if let sqlx::Error::Database(database_error) = &error
+        && database_error.is_unique_violation()
+    {
+        return AuthError::UsernameConflict;
+    }
+    AuthError::Database(error)
 }
 
 fn is_valid_session_token(session_token: &str) -> bool {
