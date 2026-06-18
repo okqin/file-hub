@@ -496,6 +496,9 @@ pub async fn rename_resource(
         if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
             return Err(ResourceError::InvalidResourcePath);
         }
+        if source_name == new_name {
+            return Ok(());
+        }
         match rename_noreplace(&parent, &source_name, &parent, &new_name) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

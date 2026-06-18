@@ -36,6 +36,31 @@ async fn test_should_deny_direct_rename_without_rename_permission() -> Result<()
 }
 
 #[tokio::test]
+async fn test_should_check_rename_permission_before_parsing_request_body() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, _config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rename")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .context("build malformed unauthorized Rename request")?,
+        )
+        .await
+        .context("send malformed unauthorized Rename request")?;
+
+    assert_error(
+        response,
+        StatusCode::FORBIDDEN,
+        "rename_permission_required",
+    )
+    .await
+}
+
+#[tokio::test]
 async fn test_should_not_inherit_anonymous_rename_permission_for_authenticated_user() -> Result<()>
 {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
@@ -131,6 +156,25 @@ async fn test_should_rename_directory_within_its_containing_directory() -> Resul
         .context("download File under renamed Directory")?;
     assert_eq!(download.status(), StatusCode::OK);
     assert!(!storage_root.path().join("docs/original").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_should_treat_same_resource_name_as_successful_noop() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    fs::write(storage_root.path().join("same.txt"), b"content")
+        .await
+        .context("write source File")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_rename_permission(&config).await?;
+
+    let response = rename_request(app, "same.txt", "same.txt").await?;
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let content = fs::read(storage_root.path().join("same.txt"))
+        .await
+        .context("read source File after same-name Rename")?;
+    assert_eq!(content, b"content");
     Ok(())
 }
 
