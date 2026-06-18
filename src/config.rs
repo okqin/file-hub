@@ -33,6 +33,8 @@ pub struct ServerConfig {
 /// Bounded runtime settings.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeLimits {
+    upload_single_file_size_limit_bytes: NonZeroU64,
+    upload_total_size_limit_bytes: NonZeroU64,
     listing_direct_child_limit: NonZeroUsize,
     archive_resource_count_limit: NonZeroUsize,
     archive_uncompressed_size_limit_bytes: NonZeroU64,
@@ -95,6 +97,10 @@ struct RawServerConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuntimeLimits {
+    #[serde(default = "default_upload_single_file_size_limit_bytes")]
+    upload_single_file_size_limit_bytes: u64,
+    #[serde(default = "default_upload_total_size_limit_bytes")]
+    upload_total_size_limit_bytes: u64,
     listing_direct_child_limit: usize,
     archive_resource_count_limit: usize,
     archive_uncompressed_size_limit_bytes: u64,
@@ -132,6 +138,20 @@ impl Validate for RawServerConfig {
 impl Validate for RawRuntimeLimits {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
+        add_u64_range_error(
+            &mut errors,
+            "upload_single_file_size_limit_bytes",
+            self.upload_single_file_size_limit_bytes,
+            1,
+            1_099_511_627_776,
+        );
+        add_u64_range_error(
+            &mut errors,
+            "upload_total_size_limit_bytes",
+            self.upload_total_size_limit_bytes,
+            1,
+            1_099_511_627_776,
+        );
         add_range_error(
             &mut errors,
             "listing_direct_child_limit",
@@ -227,6 +247,14 @@ impl AppConfig {
                 .map_err(AppConfigError::TimeZone)?,
         };
         let limits = RuntimeLimits {
+            upload_single_file_size_limit_bytes: non_zero_u64(
+                raw.limits.upload_single_file_size_limit_bytes,
+                "limits.upload_single_file_size_limit_bytes",
+            )?,
+            upload_total_size_limit_bytes: non_zero_u64(
+                raw.limits.upload_total_size_limit_bytes,
+                "limits.upload_total_size_limit_bytes",
+            )?,
             listing_direct_child_limit: non_zero(
                 raw.limits.listing_direct_child_limit,
                 "limits.listing_direct_child_limit",
@@ -316,6 +344,18 @@ impl ServerConfig {
 }
 
 impl RuntimeLimits {
+    /// Return the maximum byte size of one uploaded File.
+    #[must_use]
+    pub const fn upload_single_file_size_limit_bytes(self) -> NonZeroU64 {
+        self.upload_single_file_size_limit_bytes
+    }
+
+    /// Return the maximum aggregate File content byte size of one upload request.
+    #[must_use]
+    pub const fn upload_total_size_limit_bytes(self) -> NonZeroU64 {
+        self.upload_total_size_limit_bytes
+    }
+
     /// Return the maximum number of direct child resources in one listing.
     #[must_use]
     pub const fn listing_direct_child_limit(self) -> NonZeroUsize {
@@ -361,6 +401,14 @@ impl RuntimeLimits {
 
 fn default_staging_directory_name() -> String {
     ".fh-staging".to_owned()
+}
+
+const fn default_upload_single_file_size_limit_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+const fn default_upload_total_size_limit_bytes() -> u64 {
+    100 * 1024 * 1024
 }
 
 fn non_zero(value: usize, field: &'static str) -> Result<NonZeroUsize, AppConfigError> {

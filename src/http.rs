@@ -5,7 +5,10 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{FromRequestParts, Path as AxumPath, Query, State},
+    extract::{
+        DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path as AxumPath, Query, State,
+        multipart::Field,
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -54,6 +57,9 @@ pub async fn build_router_with_bootstrap_report(
     );
     let (auth, bootstrap_report) = AuthState::initialize(config.database_path()).await?;
     log_bootstrap_password(&bootstrap_report);
+    let upload_body_limit = usize::try_from(config.limits().upload_total_size_limit_bytes().get())
+        .unwrap_or(usize::MAX)
+        .saturating_add(64 * 1024);
     let state = AppState {
         config: Arc::new(config),
         auth,
@@ -92,6 +98,11 @@ pub async fn build_router_with_bootstrap_report(
         .route("/api/search", get(search_resources))
         .route("/api/download", get(download_file))
         .route("/api/archive", get(download_directory_archive))
+        .route("/api/mkdir", post(create_directory))
+        .route(
+            "/api/upload",
+            post(upload_file).layer(DefaultBodyLimit::max(upload_body_limit)),
+        )
         .with_state(state)
         .layer(ServiceBuilder::new().layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -166,6 +177,13 @@ struct ListQuery {
 #[serde(deny_unknown_fields)]
 struct DownloadQuery {
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CreateDirectoryRequest {
+    path: String,
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,6 +556,119 @@ async fn list_root_directory(
         .map_err(ApiError::from)
 }
 
+async fn create_directory(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Result<StatusCode, ApiError> {
+    require_upload_permission(&state, request.headers()).await?;
+    let Json(request) = Json::<CreateDirectoryRequest>::from_request(request, &state)
+        .await
+        .map_err(|_| ApiError::invalid_create_directory_request())?;
+    resource::create_directory(&state.config, &request.path, &request.name).await?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn upload_file(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Result<StatusCode, ApiError> {
+    require_upload_permission(&state, request.headers()).await?;
+    let mut multipart = Multipart::from_request(request, &state)
+        .await
+        .map_err(|_| ApiError::invalid_upload_request())?;
+    let mut path = None;
+    let mut staged_upload: Option<resource::StagedFileUpload> = None;
+
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => {
+                if let Some(upload) = staged_upload {
+                    upload.abort().await;
+                }
+                return Err(ApiError::invalid_upload_request());
+            }
+        };
+        match field.name() {
+            Some("path") if path.is_none() && staged_upload.is_none() => {
+                let value = read_upload_path(&mut field).await?;
+                path = Some(value);
+            }
+            Some("file") if staged_upload.is_none() => {
+                let current_path = path
+                    .as_deref()
+                    .ok_or_else(ApiError::invalid_upload_request)?;
+                let filename = field
+                    .file_name()
+                    .map(str::to_owned)
+                    .ok_or_else(ApiError::invalid_upload_request)?;
+                let mut upload =
+                    resource::StagedFileUpload::start(&state.config, current_path, &filename)
+                        .await?;
+                loop {
+                    let Ok(chunk) = field.chunk().await else {
+                        upload.abort().await;
+                        return Err(ApiError::invalid_upload_request());
+                    };
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+                    if let Err(error) = upload.write_chunk(&chunk).await {
+                        upload.abort().await;
+                        return Err(error.into());
+                    }
+                }
+                staged_upload = Some(upload);
+            }
+            _ => {
+                if let Some(upload) = staged_upload {
+                    upload.abort().await;
+                }
+                return Err(ApiError::invalid_upload_request());
+            }
+        }
+    }
+
+    staged_upload
+        .ok_or_else(ApiError::invalid_upload_request)?
+        .commit()
+        .await?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn read_upload_path(field: &mut Field<'_>) -> Result<String, ApiError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|_| ApiError::invalid_upload_request())?
+    {
+        let next_length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(ApiError::invalid_upload_request)?;
+        if next_length > resource::MAX_RESOURCE_PATH_BYTES {
+            return Err(ApiError::invalid_upload_request());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| ApiError::invalid_upload_request())
+}
+
+async fn require_upload_permission(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let token = session_token_from_headers(headers);
+    let permissions = match state.auth.identity_for_session(token.as_deref()).await? {
+        Some(identity) => identity.permissions(),
+        None => state.auth.anonymous_permissions().await?,
+    };
+    if permissions.upload() {
+        Ok(())
+    } else {
+        Err(ApiError::upload_permission_required())
+    }
+}
+
 async fn download_file(
     State(state): State<AppState>,
     Query(query): Query<DownloadQuery>,
@@ -663,6 +794,12 @@ impl From<resource::ResourceError> for ApiError {
                 code: "invalid_resource_name",
                 reason: "resource name is not valid UTF-8".to_owned(),
             },
+            error @ (resource::ResourceError::InvalidWriteResourceName
+            | resource::ResourceError::NameConflict
+            | resource::ResourceError::CreateDirectory(_)
+            | resource::ResourceError::UploadSingleFileSizeLimitExceeded { .. }
+            | resource::ResourceError::UploadTotalSizeLimitExceeded { .. }
+            | resource::ResourceError::StoreUpload(_)) => Self::from_write_error(&error),
             resource::ResourceError::ReadDirectory(_)
             | resource::ResourceError::ReadEntry(_)
             | resource::ResourceError::Metadata(_)
@@ -740,6 +877,42 @@ impl From<&ManagedUser> for ManagedUserResponse {
 }
 
 impl ApiError {
+    fn from_write_error(error: &resource::ResourceError) -> Self {
+        match error {
+            resource::ResourceError::InvalidWriteResourceName => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_resource_name",
+                reason: "Resource Name is invalid".to_owned(),
+            },
+            resource::ResourceError::NameConflict => Self {
+                status: StatusCode::CONFLICT,
+                code: "name_conflict",
+                reason: "Resource Name conflicts with an existing Resource".to_owned(),
+            },
+            resource::ResourceError::CreateDirectory(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "create_directory_failed",
+                reason: "failed to create Directory".to_owned(),
+            },
+            resource::ResourceError::UploadSingleFileSizeLimitExceeded { limit } => Self {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "upload_single_file_size_limit_exceeded",
+                reason: format!("uploaded File exceeds configured size limit of {limit} bytes"),
+            },
+            resource::ResourceError::UploadTotalSizeLimitExceeded { limit } => Self {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "upload_total_size_limit_exceeded",
+                reason: format!("upload exceeds configured total size limit of {limit} bytes"),
+            },
+            resource::ResourceError::StoreUpload(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "upload_failed",
+                reason: "failed to store uploaded File".to_owned(),
+            },
+            _ => Self::internal_server_error(),
+        }
+    }
+
     fn internal_server_error() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -769,6 +942,30 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
             reason: "administrator identity is required".to_owned(),
+        }
+    }
+
+    fn upload_permission_required() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "upload_permission_required",
+            reason: "Upload Permission is required".to_owned(),
+        }
+    }
+
+    fn invalid_upload_request() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_upload_request",
+            reason: "upload request is invalid".to_owned(),
+        }
+    }
+
+    fn invalid_create_directory_request() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_create_directory_request",
+            reason: "create Directory request is invalid".to_owned(),
         }
     }
 
@@ -1202,6 +1399,49 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .toolbar {
       justify-content: space-between;
     }
+    .write-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    progress {
+      width: 160px;
+      height: 12px;
+    }
+    dialog {
+      width: min(420px, calc(100% - 28px));
+      padding: 20px;
+      border: 1px solid #8c959f;
+      border-radius: 6px;
+    }
+    dialog::backdrop {
+      background: rgb(0 0 0 / .35);
+    }
+    dialog form {
+      display: grid;
+      gap: 16px;
+    }
+    dialog h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .dialog-actions button {
+      min-height: 36px;
+      padding: 7px 12px;
+      border: 1px solid #8c959f;
+      border-radius: 4px;
+      background: #fff;
+    }
+    .dialog-actions button.primary {
+      border-color: #0969da;
+      background: #0969da;
+      color: #fff;
+    }
     .filter {
       display: flex;
       align-items: center;
@@ -1275,6 +1515,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <nav aria-label="Breadcrumb" class="breadcrumb" id="breadcrumb"></nav>
     <div class="toolbar">
       <button type="button" id="return-to-parent" class="parent" hidden>Return to parent</button>
+      <div class="write-actions">
+        <button type="button" id="upload-file-action" hidden>Upload file</button>
+        <input type="file" id="upload-file-input" hidden>
+        <button type="button" id="create-directory-action" hidden>Create directory</button>
+        <progress id="upload-progress" max="100" value="0" hidden></progress>
+      </div>
       <div class="filter">
         <label for="search-mode">Search Mode</label>
         <select id="search-mode">
@@ -1302,6 +1548,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </tbody>
       </table>
     </section>
+    <dialog id="create-directory-dialog">
+      <form id="create-directory-form">
+        <h2>Create directory</h2>
+        <label for="create-directory-name">Directory name</label>
+        <input id="create-directory-name" name="name" maxlength="255" required autocomplete="off">
+        <div class="dialog-actions">
+          <button type="button" id="cancel-create-directory">Cancel</button>
+          <button type="submit" class="primary">Create</button>
+        </div>
+      </form>
+    </dialog>
   </main>
   <script>
     (function () {
@@ -1316,6 +1573,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       var passwordChangeAction = document.getElementById('password-change-action');
       var logoutAction = document.getElementById('logout-action');
       var consoleEntry = document.getElementById('console-entry');
+      var uploadFileAction = document.getElementById('upload-file-action');
+      var uploadFileInput = document.getElementById('upload-file-input');
+      var createDirectoryAction = document.getElementById('create-directory-action');
+      var createDirectoryDialog = document.getElementById('create-directory-dialog');
+      var createDirectoryForm = document.getElementById('create-directory-form');
+      var createDirectoryName = document.getElementById('create-directory-name');
+      var cancelCreateDirectory = document.getElementById('cancel-create-directory');
+      var uploadProgress = document.getElementById('upload-progress');
       var sortButtons = Array.prototype.slice.call(document.querySelectorAll('[data-sort-field]'));
       var sortIndicators = Array.prototype.slice.call(document.querySelectorAll('[data-sort-indicator]'));
       var state = {
@@ -1381,7 +1646,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           .catch(function () {
             renderIdentity({
               authenticated: false,
-              actions: { login: true, passwordChange: false, logout: false, console: false }
+              actions: { login: true, passwordChange: false, logout: false, console: false, upload: false }
             });
           });
       }
@@ -1392,6 +1657,77 @@ const INDEX_HTML: &str = r#"<!doctype html>
         passwordChangeAction.hidden = !identity.actions.passwordChange;
         logoutAction.hidden = !identity.actions.logout;
         consoleEntry.hidden = !identity.actions.console;
+        uploadFileAction.hidden = !identity.actions.upload;
+        createDirectoryAction.hidden = !identity.actions.upload;
+      }
+
+      function resetAfterWrite() {
+        state.filter = '';
+        state.searchMode = 'currentListFilter';
+        filter.value = '';
+        searchMode.value = state.searchMode;
+        renderSearchMode();
+        loadDirectory(state.path);
+      }
+
+      function uploadFile(file) {
+        var form = new FormData();
+        form.append('path', state.path);
+        form.append('file', file, file.name);
+        var request = new XMLHttpRequest();
+        request.open('POST', '/api/upload');
+        request.upload.onprogress = function (event) {
+          uploadProgress.hidden = false;
+          uploadProgress.value = event.lengthComputable && event.total
+            ? Math.round((event.loaded / event.total) * 100)
+            : 0;
+        };
+        request.onload = function () {
+          uploadProgress.hidden = true;
+          uploadFileInput.value = '';
+          if (request.status >= 200 && request.status < 300) {
+            resetAfterWrite();
+            return;
+          }
+          var body = {};
+          try {
+            body = JSON.parse(request.responseText);
+          } catch (_error) {
+            body = {};
+          }
+          renderError(body.error && body.error.reason ? body.error.reason : 'Upload failed');
+        };
+        request.onerror = function () {
+          uploadProgress.hidden = true;
+          renderError('Upload failed');
+        };
+        request.send(form);
+      }
+
+      function createDirectory() {
+        createDirectoryForm.reset();
+        createDirectoryDialog.showModal();
+        createDirectoryName.focus();
+      }
+
+      function submitCreateDirectory(event) {
+        event.preventDefault();
+        fetch('/api/mkdir', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ path: state.path, name: createDirectoryName.value })
+        }).then(function (response) {
+          if (response.ok) {
+            createDirectoryDialog.close();
+            resetAfterWrite();
+            return;
+          }
+          return response.json().then(function (body) {
+            throw new Error(body.error && body.error.reason ? body.error.reason : 'Create Directory failed');
+          });
+        }).catch(function (error) {
+          renderError(error.message);
+        });
       }
 
       function login() {
@@ -1647,6 +1983,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
       loginAction.addEventListener('click', login);
       passwordChangeAction.addEventListener('click', changePassword);
       logoutAction.addEventListener('click', logout);
+      uploadFileAction.addEventListener('click', function () {
+        uploadFileInput.click();
+      });
+      uploadFileInput.addEventListener('change', function () {
+        if (uploadFileInput.files && uploadFileInput.files.length === 1) {
+          uploadFile(uploadFileInput.files[0]);
+        }
+      });
+      createDirectoryAction.addEventListener('click', createDirectory);
+      createDirectoryForm.addEventListener('submit', submitCreateDirectory);
+      cancelCreateDirectory.addEventListener('click', function () {
+        createDirectoryDialog.close();
+      });
 
       searchMode.addEventListener('change', function () {
         state.searchMode = searchMode.value;

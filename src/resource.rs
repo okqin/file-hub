@@ -2,20 +2,33 @@
 
 use std::{
     cmp::Ordering,
+    fmt::Write as FmtWrite,
     io::{Cursor, Write},
     path::PathBuf,
 };
 
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapOpenOptions},
+};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs, fs::File};
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+    task,
+};
+use tracing::warn;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::config::AppConfig;
 
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
+const MAX_RESOURCE_NAME_BYTES: usize = 255;
+pub(crate) const MAX_RESOURCE_PATH_BYTES: usize = 4096;
+const MAX_RESOURCE_PATH_SEGMENTS: usize = 256;
 
 /// Root directory listing response.
 #[derive(Debug, Serialize)]
@@ -208,6 +221,44 @@ pub enum ResourceError {
     /// Directory Archive payload length exceeded supported response metadata.
     #[error("directory archive length is unsupported")]
     ArchiveLengthOverflow,
+    /// A Resource Name supplied for a write action is invalid.
+    #[error("resource name is invalid")]
+    InvalidWriteResourceName,
+    /// A Resource already exists at the requested destination.
+    #[error("resource name conflicts with an existing resource")]
+    NameConflict,
+    /// A Directory Resource could not be created.
+    #[error("failed to create directory resource")]
+    CreateDirectory(#[source] std::io::Error),
+    /// One uploaded File exceeded the configured byte limit.
+    #[error("uploaded file exceeds configured size limit of {limit} bytes")]
+    UploadSingleFileSizeLimitExceeded {
+        /// Configured single File byte limit.
+        limit: u64,
+    },
+    /// One upload request exceeded the configured aggregate byte limit.
+    #[error("upload exceeds configured total size limit of {limit} bytes")]
+    UploadTotalSizeLimitExceeded {
+        /// Configured aggregate upload byte limit.
+        limit: u64,
+    },
+    /// Staging or publishing an uploaded File failed.
+    #[error("failed to store uploaded file")]
+    StoreUpload(#[source] std::io::Error),
+}
+
+/// A File being written in the reserved staging area before atomic publication.
+#[derive(Debug)]
+pub struct StagedFileUpload {
+    file: File,
+    staging_directory: Dir,
+    destination_directory: Dir,
+    staging_name: String,
+    destination_name: String,
+    cleanup_staging: bool,
+    bytes_written: u64,
+    single_file_limit: u64,
+    total_upload_limit: u64,
 }
 
 /// List direct resources in the Root Directory.
@@ -224,6 +275,260 @@ pub async fn list_root_directory(config: &AppConfig) -> Result<DirectoryListing,
         CurrentListFilter::default(),
     )
     .await
+}
+
+/// Create a Directory under the current Resource Path.
+///
+/// # Errors
+///
+/// Returns an error when the Resource Path or Resource Name is invalid, the destination already
+/// exists, or the Directory cannot be created.
+pub async fn create_directory(
+    config: &AppConfig,
+    path: &str,
+    name: &str,
+) -> Result<(), ResourceError> {
+    let resource_path = ResourcePath::parse(path)?;
+    if resource_path.contains_reserved_name(config.staging_directory_name()) {
+        return Err(ResourceError::InvalidResourcePath);
+    }
+    if !is_valid_resource_name(name) || name == config.staging_directory_name() {
+        return Err(ResourceError::InvalidWriteResourceName);
+    }
+
+    let storage_root = config.storage_root().to_path_buf();
+    let segments = owned_segments(&resource_path);
+    let name = name.to_owned();
+    task::spawn_blocking(move || {
+        let root = Dir::open_ambient_dir(storage_root, ambient_authority())
+            .map_err(ResourceError::CreateDirectory)?;
+        let parent = open_relative_directory(&root, &segments)?;
+        match parent.create_dir(name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ResourceError::NameConflict)
+            }
+            Err(error) => Err(ResourceError::CreateDirectory(error)),
+        }
+    })
+    .await
+    .map_err(blocking_task_error)??;
+    Ok(())
+}
+
+impl StagedFileUpload {
+    /// Start staging one File for upload into the current Resource Path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid path or name, an existing destination, or a staging IO
+    /// failure.
+    pub async fn start(config: &AppConfig, path: &str, name: &str) -> Result<Self, ResourceError> {
+        let resource_path = ResourcePath::parse(path)?;
+        if resource_path.contains_reserved_name(config.staging_directory_name()) {
+            return Err(ResourceError::InvalidResourcePath);
+        }
+        if !is_valid_resource_name(name) || name == config.staging_directory_name() {
+            return Err(ResourceError::InvalidWriteResourceName);
+        }
+
+        let storage_root = config.storage_root().to_path_buf();
+        let segments = owned_segments(&resource_path);
+        let destination_name = name.to_owned();
+        let staging_directory_name = config.staging_directory_name().to_owned();
+        let (file, staging_directory, destination_directory, staging_name) =
+            task::spawn_blocking(move || {
+                let root = Dir::open_ambient_dir(storage_root, ambient_authority())
+                    .map_err(ResourceError::StoreUpload)?;
+                let destination_directory = open_relative_directory(&root, &segments)?;
+                match destination_directory.symlink_metadata(&destination_name) {
+                    Ok(_) => return Err(ResourceError::NameConflict),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(ResourceError::StoreUpload(error)),
+                }
+                let staging_directory = open_staging_directory(&root, &staging_directory_name)?;
+                let staging_name = create_staging_name()?;
+                let mut options = CapOpenOptions::new();
+                options.write(true).create_new(true);
+                let file = staging_directory
+                    .open_with(&staging_name, &options)
+                    .map_err(ResourceError::StoreUpload)?;
+                Ok((
+                    File::from_std(file.into_std()),
+                    staging_directory,
+                    destination_directory,
+                    staging_name,
+                ))
+            })
+            .await
+            .map_err(blocking_task_error)??;
+        Ok(Self {
+            file,
+            staging_directory,
+            destination_directory,
+            staging_name,
+            destination_name: name.to_owned(),
+            cleanup_staging: true,
+            bytes_written: 0,
+            single_file_limit: config.limits().upload_single_file_size_limit_bytes().get(),
+            total_upload_limit: config.limits().upload_total_size_limit_bytes().get(),
+        })
+    }
+
+    /// Append one multipart chunk to the staged File.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured upload limit is exceeded or staging IO fails.
+    pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ResourceError> {
+        let chunk_length = u64::try_from(chunk.len()).map_err(|_| {
+            ResourceError::UploadSingleFileSizeLimitExceeded {
+                limit: self.single_file_limit,
+            }
+        })?;
+        let next_length = self.bytes_written.checked_add(chunk_length).ok_or(
+            ResourceError::UploadSingleFileSizeLimitExceeded {
+                limit: self.single_file_limit,
+            },
+        )?;
+        if next_length > self.single_file_limit {
+            return Err(ResourceError::UploadSingleFileSizeLimitExceeded {
+                limit: self.single_file_limit,
+            });
+        }
+        if next_length > self.total_upload_limit {
+            return Err(ResourceError::UploadTotalSizeLimitExceeded {
+                limit: self.total_upload_limit,
+            });
+        }
+        self.file
+            .write_all(chunk)
+            .await
+            .map_err(ResourceError::StoreUpload)?;
+        self.bytes_written = next_length;
+        Ok(())
+    }
+
+    /// Publish the complete staged File atomically without replacing an existing Resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination conflicts or filesystem publication fails.
+    pub async fn commit(mut self) -> Result<(), ResourceError> {
+        if let Err(error) = self.file.sync_all().await {
+            return Err(ResourceError::StoreUpload(error));
+        }
+        let staging_directory = self
+            .staging_directory
+            .try_clone()
+            .map_err(ResourceError::StoreUpload)?;
+        let destination_directory = self
+            .destination_directory
+            .try_clone()
+            .map_err(ResourceError::StoreUpload)?;
+        let staging_name = self.staging_name.clone();
+        let destination_name = self.destination_name.clone();
+        let publish = task::spawn_blocking(move || {
+            staging_directory.hard_link(&staging_name, &destination_directory, &destination_name)
+        })
+        .await
+        .map_err(blocking_task_error)?;
+        match publish {
+            Ok(()) => {
+                if let Err(error) = self.remove_staging().await {
+                    warn!(%error, staging_name = %self.staging_name, "failed to remove published staging file");
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ResourceError::NameConflict)
+            }
+            Err(error) => Err(ResourceError::StoreUpload(error)),
+        }
+    }
+
+    /// Remove a staged File after parsing or validation fails.
+    pub async fn abort(mut self) {
+        let _cleanup_result = self.remove_staging().await;
+    }
+
+    async fn remove_staging(&mut self) -> Result<(), std::io::Error> {
+        let staging_directory = self.staging_directory.try_clone()?;
+        let staging_name = self.staging_name.clone();
+        task::spawn_blocking(move || staging_directory.remove_file(staging_name))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))??;
+        self.cleanup_staging = false;
+        Ok(())
+    }
+}
+
+impl Drop for StagedFileUpload {
+    fn drop(&mut self) {
+        // Drop is the cancellation path; a synchronous unlink also works during runtime shutdown.
+        if self.cleanup_staging
+            && let Err(error) = self.staging_directory.remove_file(&self.staging_name)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, staging_name = %self.staging_name, "failed to clean up staged upload");
+        }
+    }
+}
+
+fn create_staging_name() -> Result<String, ResourceError> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| ResourceError::StoreUpload(std::io::Error::other(error.to_string())))?;
+    let mut name = String::with_capacity(random.len() * 2);
+    for byte in random {
+        write!(&mut name, "{byte:02x}").map_err(|error| {
+            ResourceError::StoreUpload(std::io::Error::other(error.to_string()))
+        })?;
+    }
+    Ok(name)
+}
+
+fn owned_segments(resource_path: &ResourcePath<'_>) -> Vec<String> {
+    resource_path
+        .segments
+        .iter()
+        .map(|segment| (*segment).to_owned())
+        .collect()
+}
+
+fn open_relative_directory(root: &Dir, segments: &[String]) -> Result<Dir, ResourceError> {
+    let mut directory = root.try_clone().map_err(ResourceError::ReadDirectory)?;
+    for segment in segments {
+        let metadata = directory
+            .symlink_metadata(segment)
+            .map_err(map_resolve_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ResourceError::NotDirectory);
+        }
+        directory = directory.open_dir(segment).map_err(map_resolve_error)?;
+    }
+    Ok(directory)
+}
+
+fn open_staging_directory(root: &Dir, name: &str) -> Result<Dir, ResourceError> {
+    match root.create_dir(name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(ResourceError::StoreUpload(error)),
+    }
+    let metadata = root
+        .symlink_metadata(name)
+        .map_err(ResourceError::StoreUpload)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ResourceError::StoreUpload(std::io::Error::other(
+            "reserved staging path is not a directory",
+        )));
+    }
+    root.open_dir(name).map_err(ResourceError::StoreUpload)
+}
+
+fn blocking_task_error(error: task::JoinError) -> ResourceError {
+    ResourceError::StoreUpload(std::io::Error::other(error))
 }
 
 /// List direct resources in a Directory.
@@ -509,6 +814,9 @@ struct ResourcePath<'a> {
 
 impl<'a> ResourcePath<'a> {
     fn parse(raw: &'a str) -> Result<Self, ResourceError> {
+        if raw.len() > MAX_RESOURCE_PATH_BYTES {
+            return Err(ResourceError::InvalidResourcePath);
+        }
         if raw.is_empty() {
             return Ok(Self {
                 raw,
@@ -517,9 +825,10 @@ impl<'a> ResourcePath<'a> {
         }
 
         let segments: Vec<&str> = raw.split('/').collect();
-        if segments
-            .iter()
-            .any(|segment| !is_valid_resource_name(segment))
+        if segments.len() > MAX_RESOURCE_PATH_SEGMENTS
+            || segments
+                .iter()
+                .any(|segment| !is_valid_resource_name(segment))
         {
             return Err(ResourceError::InvalidResourcePath);
         }
@@ -791,8 +1100,10 @@ fn join_resource_path(containing_path: &str, name: &str) -> String {
 
 fn is_valid_resource_name(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= MAX_RESOURCE_NAME_BYTES
         && name != "."
         && name != ".."
+        && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
         && !name.chars().any(char::is_control)
