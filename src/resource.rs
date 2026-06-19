@@ -15,6 +15,8 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+use cap_std::fs::MetadataExt;
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions as CapOpenOptions},
@@ -563,7 +565,7 @@ pub async fn delete_resource(config: &AppConfig, path: &str) -> Result<(), Resou
             return Err(ResourceError::InvalidResourcePath);
         }
         if metadata.is_dir() {
-            remove_directory_resource(&parent, &target_name, &task_path)?;
+            remove_directory_resource(&parent, &target_name, &task_path, &metadata)?;
         } else {
             parent
                 .remove_file(&target_name)
@@ -588,9 +590,9 @@ fn remove_directory_resource(
     parent: &Dir,
     name: &str,
     resource_path: &str,
+    expected_metadata: &cap_std::fs::Metadata,
 ) -> Result<(), ResourceError> {
-    let directory = parent
-        .open_dir(name)
+    let directory = open_directory_nofollow(parent, name, expected_metadata)
         .map_err(|error| delete_failure(resource_path, "open Directory", error))?;
     let entries = directory
         .entries()
@@ -625,7 +627,7 @@ fn remove_directory_resource(
             ));
         }
         if metadata.is_dir() {
-            remove_directory_resource(&directory, child_name, &child_path)?;
+            remove_directory_resource(&directory, child_name, &child_path, &metadata)?;
         } else if metadata.is_file() {
             directory
                 .remove_file(child_name)
@@ -645,6 +647,42 @@ fn remove_directory_resource(
     parent
         .remove_dir(name)
         .map_err(|error| delete_failure(resource_path, "delete Directory", error))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux", target_vendor = "apple"))]
+fn open_directory_nofollow(
+    parent: &Dir,
+    name: &str,
+    expected_metadata: &cap_std::fs::Metadata,
+) -> Result<Dir, std::io::Error> {
+    let descriptor = rustix::fs::openat(
+        parent.as_fd(),
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let opened_metadata = rustix::fs::fstat(&descriptor).map_err(std::io::Error::from)?;
+    if i128::from(opened_metadata.st_dev) != i128::from(expected_metadata.dev())
+        || i128::from(opened_metadata.st_ino) != i128::from(expected_metadata.ino())
+    {
+        return Err(std::io::Error::other(
+            "Directory changed while Delete was in progress",
+        ));
+    }
+    Ok(Dir::from_std_file(descriptor.into()))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux", target_vendor = "apple")))]
+fn open_directory_nofollow(
+    parent: &Dir,
+    name: &str,
+    _expected_metadata: &cap_std::fs::Metadata,
+) -> Result<Dir, std::io::Error> {
+    parent.open_dir(name)
 }
 
 fn delete_failure(path: &str, operation: &'static str, source: std::io::Error) -> ResourceError {
@@ -1894,4 +1932,52 @@ fn format_modified_time(modified_time: std::time::SystemTime, time_zone: Tz) -> 
         .with_timezone(&time_zone)
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "android", target_os = "linux", target_vendor = "apple")
+))]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use anyhow::{Context, Result};
+    use cap_std::{ambient_authority, fs::Dir};
+    use tokio::fs;
+
+    use super::open_directory_nofollow;
+
+    #[tokio::test]
+    async fn test_should_reject_directory_replaced_by_symlink_after_metadata_check() -> Result<()> {
+        let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+        fs::create_dir(storage_root.path().join("target"))
+            .await
+            .context("create target Directory")?;
+        fs::create_dir(storage_root.path().join("victim"))
+            .await
+            .context("create victim Directory")?;
+        fs::write(storage_root.path().join("victim/sentinel.txt"), b"sentinel")
+            .await
+            .context("write victim sentinel")?;
+        let root = Dir::open_ambient_dir(storage_root.path(), ambient_authority())
+            .context("open storage root")?;
+        let expected_metadata = root
+            .symlink_metadata("target")
+            .context("read target metadata")?;
+        root.remove_dir("target")
+            .context("remove original target")?;
+        symlink("victim", storage_root.path().join("target"))
+            .context("replace target with symlink")?;
+
+        let _error = open_directory_nofollow(&root, "target", &expected_metadata)
+            .expect_err("symlink replacement must be rejected");
+
+        assert_eq!(
+            fs::read(storage_root.path().join("victim/sentinel.txt"))
+                .await
+                .context("read victim sentinel")?,
+            b"sentinel",
+        );
+        Ok(())
+    }
 }

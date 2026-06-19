@@ -35,6 +35,31 @@ async fn test_should_deny_direct_delete_without_delete_permission() -> Result<()
 }
 
 #[tokio::test]
+async fn test_should_authorize_delete_before_parsing_request_body() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, _config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/delete")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("not valid JSON"))
+                .context("build malformed unauthorized Delete request")?,
+        )
+        .await
+        .context("send malformed unauthorized Delete request")?;
+
+    assert_error(
+        response,
+        StatusCode::FORBIDDEN,
+        "delete_permission_required",
+    )
+    .await
+}
+
+#[tokio::test]
 async fn test_should_not_inherit_anonymous_delete_permission_for_authenticated_user() -> Result<()>
 {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
@@ -205,6 +230,39 @@ async fn test_should_reject_symlink_delete_target_with_clear_write_failure() -> 
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_should_fail_fast_on_nested_symlink_without_touching_its_target() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let outside = tempfile::tempdir().context("create outside directory")?;
+    fs::create_dir(storage_root.path().join("target"))
+        .await
+        .context("create target Directory")?;
+    fs::write(outside.path().join("outside.txt"), b"outside")
+        .await
+        .context("write outside File")?;
+    symlink(outside.path(), storage_root.path().join("target/linked"))
+        .context("create nested symlink")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_delete_permission(&config).await?;
+
+    let response = delete_request(app, "target").await?;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .context("read nested symlink Delete Failure response")?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).context("decode nested symlink Delete Failure response")?;
+    assert_eq!(body.pointer("/error/code"), Some(&"delete_failed".into()));
+    assert_eq!(body.pointer("/error/path"), Some(&"target/linked".into()));
+    assert!(storage_root.path().join("target/linked").exists());
+    assert!(outside.path().join("outside.txt").exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_should_render_delete_available_action_only_with_delete_permission() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
@@ -351,7 +409,10 @@ async fn test_should_report_first_affected_path_on_partial_recursive_delete_fail
         .pointer("/error/reason")
         .and_then(serde_json::Value::as_str)
         .context("partial Delete Failure should contain a reason")?;
-    assert!(reason.contains("failed to open Directory"));
+    assert!(
+        reason.contains("failed to open Directory") || reason.contains("failed to read Directory"),
+        "unexpected partial Delete Failure reason: {reason}",
+    );
     assert!(storage_root.path().join("target").exists());
     Ok(())
 }
