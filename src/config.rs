@@ -33,6 +33,8 @@ pub struct ServerConfig {
 /// Bounded runtime settings.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeLimits {
+    request_body_limit_bytes: NonZeroU64,
+    request_concurrency_limit: NonZeroUsize,
     upload_single_file_size_limit_bytes: NonZeroU64,
     upload_total_size_limit_bytes: NonZeroU64,
     directory_upload_resource_count_limit: NonZeroUsize,
@@ -98,6 +100,10 @@ struct RawServerConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuntimeLimits {
+    #[serde(default = "default_request_body_limit_bytes")]
+    request_body_limit_bytes: u64,
+    #[serde(default = "default_request_concurrency_limit")]
+    request_concurrency_limit: usize,
     #[serde(default = "default_upload_single_file_size_limit_bytes")]
     upload_single_file_size_limit_bytes: u64,
     #[serde(default = "default_upload_total_size_limit_bytes")]
@@ -141,6 +147,20 @@ impl Validate for RawServerConfig {
 impl Validate for RawRuntimeLimits {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
+        add_u64_range_error(
+            &mut errors,
+            "request_body_limit_bytes",
+            self.request_body_limit_bytes,
+            1,
+            1_099_511_627_776,
+        );
+        add_range_error(
+            &mut errors,
+            "request_concurrency_limit",
+            self.request_concurrency_limit,
+            1,
+            65_536,
+        );
         add_u64_range_error(
             &mut errors,
             "upload_single_file_size_limit_bytes",
@@ -257,6 +277,14 @@ impl AppConfig {
                 .map_err(AppConfigError::TimeZone)?,
         };
         let limits = RuntimeLimits {
+            request_body_limit_bytes: non_zero_u64(
+                raw.limits.request_body_limit_bytes,
+                "limits.request_body_limit_bytes",
+            )?,
+            request_concurrency_limit: non_zero(
+                raw.limits.request_concurrency_limit,
+                "limits.request_concurrency_limit",
+            )?,
             upload_single_file_size_limit_bytes: non_zero_u64(
                 raw.limits.upload_single_file_size_limit_bytes,
                 "limits.upload_single_file_size_limit_bytes",
@@ -358,6 +386,18 @@ impl ServerConfig {
 }
 
 impl RuntimeLimits {
+    /// Return the maximum request body size in bytes.
+    #[must_use]
+    pub const fn request_body_limit_bytes(self) -> NonZeroU64 {
+        self.request_body_limit_bytes
+    }
+
+    /// Return the maximum number of concurrently processed HTTP requests.
+    #[must_use]
+    pub const fn request_concurrency_limit(self) -> NonZeroUsize {
+        self.request_concurrency_limit
+    }
+
     /// Return the maximum byte size of one uploaded File.
     #[must_use]
     pub const fn upload_single_file_size_limit_bytes(self) -> NonZeroU64 {
@@ -421,6 +461,14 @@ impl RuntimeLimits {
 
 fn default_staging_directory_name() -> String {
     ".fh-staging".to_owned()
+}
+
+const fn default_request_body_limit_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+const fn default_request_concurrency_limit() -> usize {
+    128
 }
 
 const fn default_upload_single_file_size_limit_bytes() -> u64 {

@@ -1,0 +1,24 @@
+{
+  "name": "file-hub-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "browserslist": [
+    "Chrome >= 69",
+    "Firefox >= 59"
+  ],
+  "dependencies": {
+    "vue": "3.5.38"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-legacy": "8.0.2",
+    "@vitejs/plugin-vue": "6.0.7",
+    "@vue/test-utils": "2.4.11",
+    "jsdom": "29.1.1",
+    "vite": "8.0.16",
+    "vitest": "4.1.9"
+  }
+}

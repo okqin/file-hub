@@ -349,34 +349,6 @@ async fn test_should_reject_conflicting_paths_inside_uploaded_tree_and_roll_back
 }
 
 #[tokio::test]
-async fn test_should_render_permission_gated_directory_upload_with_overall_progress() -> Result<()>
-{
-    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
-    let (app, _config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .body(Body::empty())
-                .context("build browser request")?,
-        )
-        .await
-        .context("request browser page")?;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await?;
-    let body = String::from_utf8(body.to_vec()).context("browser page must be UTF-8")?;
-
-    assert!(body.contains("id=\"upload-directory-action\" hidden"));
-    assert!(body.contains("id=\"upload-directory-input\" webkitdirectory hidden"));
-    assert!(body.contains("uploadDirectoryAction.hidden = !identity.actions.upload"));
-    assert!(body.contains("form.append('relativePath', file.webkitRelativePath)"));
-    assert!(body.contains("request.upload.onprogress"));
-    assert!(body.contains("uploadProgress.value = event.lengthComputable && event.total"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_should_reject_reserved_staging_name_anywhere_in_directory_upload() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
     let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;

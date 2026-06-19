@@ -1,5 +1,9 @@
 # Documentation Index
 
+## Operations
+
+- [Runtime and packaging](runtime.md)
+
 ## Architecture Decision Records
 
 - [0001 — Vite legacy over bun bundler](adr/0001-vite-legacy-over-bun-bundler.md)

@@ -9,15 +9,18 @@ use axum::{
         DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path as AxumPath, Query, State,
         multipart::Field,
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
-    response::{Html, IntoResponse, Response},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, Uri, header, request::Parts},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
-use tower_http::timeout::TimeoutLayer;
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::warn;
 
 use crate::{
@@ -27,6 +30,10 @@ use crate::{
 };
 
 const SESSION_COOKIE_NAME: &str = "fh_session";
+
+#[derive(Debug, RustEmbed)]
+#[folder = "frontend-dist/"]
+struct FrontendAssets;
 
 /// Build the public HTTP router.
 ///
@@ -58,24 +65,33 @@ pub async fn build_router_with_bootstrap_report(
     );
     let (auth, bootstrap_report) = AuthState::initialize(config.database_path()).await?;
     log_bootstrap_password(&bootstrap_report);
-    let multipart_metadata_limit = config
-        .limits()
-        .directory_upload_resource_count_limit()
-        .get()
-        .saturating_mul(resource::MAX_RESOURCE_PATH_BYTES.saturating_add(1024));
-    let upload_body_limit = usize::try_from(config.limits().upload_total_size_limit_bytes().get())
-        .map_or(usize::MAX, |limit| {
-            limit
-                .saturating_add(multipart_metadata_limit)
-                .saturating_add(64 * 1024)
-        });
+    let request_body_limit =
+        usize::try_from(config.limits().request_body_limit_bytes().get()).unwrap_or(usize::MAX);
+    let request_semaphore = Arc::new(Semaphore::new(
+        config.limits().request_concurrency_limit().get(),
+    ));
+    let fs_semaphore = Arc::new(Semaphore::new(config.limits().fs_concurrency_limit().get()));
     let state = AppState {
         config: Arc::new(config),
         auth,
     };
 
+    let resource_router = Router::new()
+        .route("/api/list", get(list_root_directory))
+        .route("/api/search", get(search_resources))
+        .route("/api/download", get(download_file))
+        .route("/api/archive", get(download_directory_archive))
+        .route("/api/mkdir", post(create_directory))
+        .route("/api/rename", post(rename_resource))
+        .route("/api/delete", post(delete_resource))
+        .route("/api/upload", post(upload_file))
+        .layer(middleware::from_fn_with_state(
+            fs_semaphore,
+            enforce_fs_concurrency_limit,
+        ));
+
     let router = Router::new()
-        .route("/", get(index))
+        .route("/", get(spa_index))
         .route("/api/identity", get(identity))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
@@ -103,22 +119,20 @@ pub async fn build_router_with_bootstrap_report(
             "/api/console/users/{username}/password",
             post(console_reset_user_password),
         )
-        .route("/api/list", get(list_root_directory))
-        .route("/api/search", get(search_resources))
-        .route("/api/download", get(download_file))
-        .route("/api/archive", get(download_directory_archive))
-        .route("/api/mkdir", post(create_directory))
-        .route("/api/rename", post(rename_resource))
-        .route("/api/delete", post(delete_resource))
-        .route(
-            "/api/upload",
-            post(upload_file).layer(DefaultBodyLimit::max(upload_body_limit)),
-        )
+        .merge(resource_router)
+        .fallback(spa_fallback)
         .with_state(state)
+        .layer(DefaultBodyLimit::max(request_body_limit))
+        .layer(middleware::from_fn_with_state(
+            request_semaphore,
+            enforce_request_concurrency_limit,
+        ))
         .layer(ServiceBuilder::new().layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             timeout,
-        )));
+        )))
+        .layer(middleware::map_response(normalize_framework_error))
+        .layer(TraceLayer::new_for_http());
 
     Ok(RouterWithBootstrapReport {
         router,
@@ -319,8 +333,8 @@ struct ApiError {
     reason: String,
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn spa_index() -> Result<Response, ApiError> {
+    embedded_frontend_asset("index.html", false)
 }
 
 async fn identity(
@@ -414,8 +428,8 @@ async fn change_password(
     Ok(response)
 }
 
-async fn console_view(_administrator: Administrator) -> Result<Html<&'static str>, ApiError> {
-    Ok(Html(CONSOLE_HTML))
+async fn console_view(_administrator: Administrator) -> Result<Response, ApiError> {
+    spa_index().await
 }
 
 async fn console_list_users(
@@ -1289,6 +1303,51 @@ impl ApiError {
         }
     }
 
+    fn request_body_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "request_body_too_large",
+            path: None,
+            reason: "request body exceeds configured limit".to_owned(),
+        }
+    }
+
+    fn request_concurrency_limit_exceeded() -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "request_concurrency_limit_exceeded",
+            path: None,
+            reason: "request concurrency limit exceeded".to_owned(),
+        }
+    }
+
+    fn request_timeout() -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code: "request_timeout",
+            path: None,
+            reason: "request exceeded configured timeout".to_owned(),
+        }
+    }
+
+    fn fs_concurrency_limit_exceeded() -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "fs_concurrency_limit_exceeded",
+            path: None,
+            reason: "filesystem concurrency limit exceeded".to_owned(),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            path: None,
+            reason: "resource not found".to_owned(),
+        }
+    }
+
     fn invalid_create_directory_request() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -1322,6 +1381,76 @@ impl IntoResponse for ApiError {
         )
             .into_response()
     }
+}
+
+async fn normalize_framework_error(response: Response) -> Response {
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE
+        && response.headers().get(header::CONTENT_TYPE)
+            != Some(&HeaderValue::from_static("application/json"))
+    {
+        return ApiError::request_body_too_large().into_response();
+    }
+    if response.status() == StatusCode::REQUEST_TIMEOUT {
+        return ApiError::request_timeout().into_response();
+    }
+    response
+}
+
+async fn spa_fallback(uri: Uri) -> Result<Response, ApiError> {
+    let path = uri.path().trim_start_matches('/');
+    if uri.path() == "/api" || uri.path().starts_with("/api/") {
+        return Err(ApiError::not_found());
+    }
+    if path.starts_with("assets/") {
+        return embedded_frontend_asset(path, true);
+    }
+    embedded_frontend_asset("index.html", false)
+}
+
+fn embedded_frontend_asset(path: &str, immutable: bool) -> Result<Response, ApiError> {
+    let asset = FrontendAssets::get(path).ok_or_else(ApiError::not_found)?;
+    let content_type = match path.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    let cache_control = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::from(asset.data.into_owned()))
+        .map_err(|_| ApiError::internal_server_error())
+}
+
+async fn enforce_request_concurrency_limit(
+    State(semaphore): State<Arc<Semaphore>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = semaphore.try_acquire_owned() else {
+        return ApiError::request_concurrency_limit_exceeded().into_response();
+    };
+    next.run(request).await
+}
+
+async fn enforce_fs_concurrency_limit(
+    State(semaphore): State<Arc<Semaphore>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = semaphore.try_acquire_owned() else {
+        return ApiError::fs_concurrency_limit_exceeded().into_response();
+    };
+    next.run(request).await
 }
 
 fn content_disposition_header(download_name: &str) -> Result<HeaderValue, ApiError> {
@@ -1399,1141 +1528,3 @@ fn log_bootstrap_password(report: &BootstrapReport) {
         );
     }
 }
-
-const CONSOLE_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>File Hub Console</title>
-  <style>
-    :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; color: #202124; background: #f5f6f7; }
-    * { box-sizing: border-box; }
-    body { margin: 0; }
-    header { display: flex; align-items: center; justify-content: space-between; min-height: 56px; padding: 0 24px; background: #fff; border-bottom: 1px solid #d9dde3; }
-    header h1 { margin: 0; font-size: 18px; }
-    header a { color: #1769aa; text-decoration: none; }
-    main { width: min(1100px, 100%); margin: 0 auto; padding: 24px; }
-    section { margin-bottom: 28px; }
-    h2 { margin: 0 0 12px; font-size: 16px; }
-    form, .anonymous-permissions { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; padding: 16px; background: #fff; border: 1px solid #d9dde3; border-radius: 6px; }
-    label { display: grid; gap: 6px; font-size: 13px; }
-    .permission { display: flex; align-items: center; gap: 6px; min-height: 36px; }
-    input[type="text"], input[type="password"] { width: 210px; min-height: 36px; padding: 7px 9px; border: 1px solid #aeb4bd; border-radius: 4px; font: inherit; }
-    button { min-height: 36px; padding: 7px 12px; border: 1px solid #8b929c; border-radius: 4px; background: #fff; color: inherit; font: inherit; cursor: pointer; }
-    button.primary { border-color: #1769aa; background: #1769aa; color: #fff; }
-    button.danger { border-color: #b3261e; color: #b3261e; }
-    button:disabled { cursor: wait; opacity: .6; }
-    dialog { width: min(420px, calc(100% - 28px)); padding: 20px; border: 1px solid #aeb4bd; border-radius: 6px; }
-    dialog::backdrop { background: rgb(0 0 0 / .35); }
-    dialog form { padding: 0; border: 0; }
-    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; width: 100%; }
-    .table-wrap { overflow-x: auto; background: #fff; border: 1px solid #d9dde3; border-radius: 6px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 11px 12px; border-bottom: 1px solid #e3e6ea; text-align: left; white-space: nowrap; }
-    th { font-size: 12px; color: #5f6368; background: #fafbfc; }
-    tbody tr:last-child td { border-bottom: 0; }
-    td.actions { display: flex; gap: 8px; }
-    #console-status { min-height: 22px; margin: 0 0 12px; color: #5f6368; }
-    #console-status.error { color: #b3261e; }
-    .empty { color: #5f6368; text-align: center; }
-    @media (max-width: 640px) { header, main { padding-left: 14px; padding-right: 14px; } input[type="text"], input[type="password"] { width: 100%; } form { align-items: stretch; } form > label { flex: 1 1 100%; } }
-  </style>
-</head>
-<body>
-  <header><h1>File Hub Console</h1><a href="/">Back to files</a></header>
-  <main aria-label="Console">
-    <p id="console-status" role="status" aria-live="polite"></p>
-    <section aria-label="User Management">
-      <h2>Users</h2>
-      <form id="create-user-form">
-        <label>Username <input id="console-username" name="username" type="text" autocomplete="off" maxlength="64" required pattern="[A-Za-z0-9_-]{1,64}"></label>
-        <label>Initial password <input id="console-password" name="password" type="password" minlength="8" maxlength="256" required></label>
-        <label><input id="console-upload-permission" name="upload" type="checkbox"> Upload Permission</label>
-        <label><input id="console-rename-permission" name="rename" type="checkbox"> Rename Permission</label>
-        <label><input id="console-delete-permission" name="delete" type="checkbox"> Delete Permission</label>
-        <button class="primary" type="submit" id="create-user-action">Create User</button>
-      </form>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Username</th><th>Upload</th><th>Rename</th><th>Delete</th><th>Actions</th></tr></thead>
-          <tbody id="console-users"></tbody>
-        </table>
-      </div>
-    </section>
-    <section aria-label="Default Anonymous Permission Set">
-      <h2>Anonymous permissions</h2>
-      <div class="anonymous-permissions">
-        <label class="permission"><input id="anonymous-upload-permission" type="checkbox"> Upload Permission</label>
-        <label class="permission"><input id="anonymous-rename-permission" type="checkbox"> Rename Permission</label>
-        <label class="permission"><input id="anonymous-delete-permission" type="checkbox"> Delete Permission</label>
-        <button class="primary" type="button" id="save-anonymous-permissions">Save</button>
-      </div>
-    </section>
-    <dialog id="reset-password-dialog">
-      <form id="reset-password-form">
-        <h2>Reset password</h2>
-        <label>New password <input id="reset-password-value" name="password" type="password" minlength="8" maxlength="256" required></label>
-        <div class="dialog-actions">
-          <button type="button" id="cancel-password-reset">Cancel</button>
-          <button class="primary" type="submit">Reset password</button>
-        </div>
-      </form>
-    </dialog>
-  </main>
-  <script>
-    const statusArea = document.querySelector('#console-status');
-    const usersBody = document.querySelector('#console-users');
-
-    function setStatus(message, isError = false) {
-      statusArea.textContent = message;
-      statusArea.classList.toggle('error', isError);
-    }
-
-    async function api(path, options = {}) {
-      const response = await fetch(path, {
-        ...options,
-        headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(body?.error?.reason ?? `Request failed (${response.status})`);
-      }
-      return response.status === 204 ? null : response.json();
-    }
-
-    function permissionCheckbox(username, permission, checked) {
-      const input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = checked;
-      input.setAttribute('aria-label', `${username} ${permission} permission`);
-      input.addEventListener('change', async () => {
-        input.disabled = true;
-        try {
-          const row = input.closest('tr');
-          const permissions = Object.fromEntries(
-            [...row.querySelectorAll('input[type="checkbox"]')].map(item => [item.dataset.permission, item.checked]),
-          );
-          await api(`/api/console/users/${encodeURIComponent(username)}/permissions`, {
-            method: 'PATCH', body: JSON.stringify(permissions),
-          });
-          setStatus(`Updated permissions for ${username}.`);
-        } catch (error) {
-          input.checked = !input.checked;
-          setStatus(error.message, true);
-        } finally {
-          input.disabled = false;
-        }
-      });
-      input.dataset.permission = permission;
-      return input;
-    }
-
-    function actionButton(label, className, action) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = label;
-      if (className) button.className = className;
-      button.addEventListener('click', action);
-      return button;
-    }
-
-    function renderUsers(users) {
-      usersBody.replaceChildren();
-      if (users.length === 0) {
-        const cell = document.createElement('td');
-        cell.colSpan = 5;
-        cell.className = 'empty';
-        cell.textContent = 'No ordinary users';
-        const row = document.createElement('tr');
-        row.append(cell);
-        usersBody.append(row);
-        return;
-      }
-      for (const user of users) {
-        const row = document.createElement('tr');
-        const username = document.createElement('td');
-        username.textContent = user.username;
-        row.append(username);
-        for (const permission of ['upload', 'rename', 'delete']) {
-          const cell = document.createElement('td');
-          cell.append(permissionCheckbox(user.username, permission, user.permissions[permission]));
-          row.append(cell);
-        }
-        const actions = document.createElement('td');
-        actions.className = 'actions';
-        actions.append(
-          actionButton('Rename', '', async () => {
-            const nextName = window.prompt('New username', user.username);
-            if (!nextName || nextName === user.username) return;
-            try {
-              await api(`/api/console/users/${encodeURIComponent(user.username)}`, {
-                method: 'PATCH', body: JSON.stringify({ username: nextName }),
-              });
-              await loadConsole();
-              setStatus(`Renamed ${user.username} to ${nextName}.`);
-            } catch (error) { setStatus(error.message, true); }
-          }),
-          actionButton('Reset password', '', () => {
-            const dialog = document.querySelector('#reset-password-dialog');
-            dialog.dataset.username = user.username;
-            document.querySelector('#reset-password-value').value = '';
-            dialog.showModal();
-          }),
-          actionButton('Delete', 'danger', async () => {
-            if (!window.confirm(`Delete ${user.username} and revoke all sessions?`)) return;
-            try {
-              await api(`/api/console/users/${encodeURIComponent(user.username)}`, { method: 'DELETE' });
-              await loadConsole();
-              setStatus(`Deleted ${user.username}.`);
-            } catch (error) { setStatus(error.message, true); }
-          }),
-        );
-        row.append(actions);
-        usersBody.append(row);
-      }
-    }
-
-    async function loadConsole() {
-      const data = await api('/api/console/users');
-      renderUsers(data.users);
-      for (const permission of ['upload', 'rename', 'delete']) {
-        document.querySelector(`#anonymous-${permission}-permission`).checked = data.anonymousPermissions[permission];
-      }
-    }
-
-    document.querySelector('#create-user-form').addEventListener('submit', async event => {
-      event.preventDefault();
-      const form = event.currentTarget;
-      const submit = document.querySelector('#create-user-action');
-      submit.disabled = true;
-      try {
-        const permissions = Object.fromEntries(
-          ['upload', 'rename', 'delete'].map(permission => [permission, form.elements[permission].checked]),
-        );
-        await api('/api/console/users', {
-          method: 'POST',
-          body: JSON.stringify({ username: form.elements.username.value, password: form.elements.password.value, permissions }),
-        });
-        const username = form.elements.username.value;
-        form.reset();
-        await loadConsole();
-        setStatus(`Created ${username}.`);
-      } catch (error) { setStatus(error.message, true); }
-      finally { submit.disabled = false; }
-    });
-
-    document.querySelector('#save-anonymous-permissions').addEventListener('click', async event => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      try {
-        const permissions = Object.fromEntries(
-          ['upload', 'rename', 'delete'].map(permission => [permission, document.querySelector(`#anonymous-${permission}-permission`).checked]),
-        );
-        await api('/api/console/anonymous-permissions', { method: 'PATCH', body: JSON.stringify(permissions) });
-        setStatus('Updated anonymous permissions.');
-      } catch (error) { setStatus(error.message, true); }
-      finally { button.disabled = false; }
-    });
-
-    document.querySelector('#cancel-password-reset').addEventListener('click', () => {
-      document.querySelector('#reset-password-dialog').close();
-    });
-
-    document.querySelector('#reset-password-form').addEventListener('submit', async event => {
-      event.preventDefault();
-      const dialog = document.querySelector('#reset-password-dialog');
-      const username = dialog.dataset.username;
-      const password = event.currentTarget.elements.password.value;
-      try {
-        await api(`/api/console/users/${encodeURIComponent(username)}/password`, {
-          method: 'POST', body: JSON.stringify({ password }),
-        });
-        dialog.close();
-        setStatus(`Reset password and revoked sessions for ${username}.`);
-      } catch (error) { setStatus(error.message, true); }
-    });
-
-    loadConsole().catch(error => setStatus(error.message, true));
-  </script>
-</body>
-</html>"#;
-
-const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>File Hub</title>
-  <style>
-    :root {
-      color-scheme: light;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f7f8fa;
-      color: #1f2328;
-    }
-    body {
-      margin: 0;
-    }
-    main {
-      max-width: 1080px;
-      margin: 0 auto;
-      padding: 32px 24px;
-    }
-    header {
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 28px;
-      font-weight: 650;
-    }
-    .identity {
-      font-size: 14px;
-      color: #57606a;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      background: #fff;
-      border: 1px solid #d8dee4;
-    }
-    th,
-    td {
-      padding: 11px 12px;
-      border-bottom: 1px solid #d8dee4;
-      text-align: left;
-      font-size: 14px;
-    }
-    th {
-      background: #f6f8fa;
-      font-weight: 600;
-    }
-    tr:last-child td {
-      border-bottom: 0;
-    }
-    .name {
-      font-weight: 600;
-    }
-    .toolbar,
-    .breadcrumb {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 16px;
-    }
-    .toolbar {
-      justify-content: space-between;
-    }
-    .write-actions {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    progress {
-      width: 160px;
-      height: 12px;
-    }
-    dialog {
-      width: min(420px, calc(100% - 28px));
-      padding: 20px;
-      border: 1px solid #8c959f;
-      border-radius: 6px;
-    }
-    dialog::backdrop {
-      background: rgb(0 0 0 / .35);
-    }
-    dialog form {
-      display: grid;
-      gap: 16px;
-    }
-    dialog h2 {
-      margin: 0;
-      font-size: 18px;
-    }
-    .dialog-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-    }
-    .dialog-actions button {
-      min-height: 36px;
-      padding: 7px 12px;
-      border: 1px solid #8c959f;
-      border-radius: 4px;
-      background: #fff;
-    }
-    .dialog-actions button.primary {
-      border-color: #0969da;
-      background: #0969da;
-      color: #fff;
-    }
-    .filter {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    label {
-      font-size: 14px;
-      font-weight: 600;
-    }
-    input,
-    select {
-      min-width: 260px;
-      padding: 8px 10px;
-      border: 1px solid #d8dee4;
-      border-radius: 6px;
-      font: inherit;
-    }
-    select {
-      min-width: 180px;
-    }
-    button {
-      padding: 0;
-      border: 0;
-      background: transparent;
-      color: #0969da;
-      font: inherit;
-      cursor: pointer;
-    }
-    button:hover {
-      text-decoration: underline;
-    }
-    button[hidden] {
-      display: none;
-    }
-    .parent {
-      padding: 7px 10px;
-      border: 1px solid #d8dee4;
-      border-radius: 6px;
-      background: #fff;
-    }
-    .sort-button {
-      color: #1f2328;
-      font-weight: 600;
-    }
-    .sort-direction {
-      margin-left: 4px;
-      color: #57606a;
-      font-size: 12px;
-    }
-    .muted {
-      color: #57606a;
-    }
-    .error {
-      color: #cf222e;
-      font-weight: 600;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <header>
-      <h1>File Hub</h1>
-      <div class="identity" aria-label="Identity Area" id="identity-area">
-        <span id="identity-username">Anonymous</span>
-        <button type="button" id="login-action">Login</button>
-        <button type="button" id="password-change-action" hidden>Change password</button>
-        <button type="button" id="logout-action" hidden>Logout</button>
-        <a href="/console" id="console-entry" hidden>Console</a>
-      </div>
-    </header>
-    <nav aria-label="Breadcrumb" class="breadcrumb" id="breadcrumb"></nav>
-    <div class="toolbar">
-      <button type="button" id="return-to-parent" class="parent" hidden>Return to parent</button>
-      <div class="write-actions">
-        <button type="button" id="upload-file-action" hidden>Upload file</button>
-        <input type="file" id="upload-file-input" hidden>
-        <button type="button" id="upload-directory-action" hidden>Upload directory</button>
-        <input type="file" id="upload-directory-input" webkitdirectory hidden>
-        <button type="button" id="create-directory-action" hidden>Create directory</button>
-        <progress id="upload-progress" max="100" value="0" hidden></progress>
-      </div>
-      <div class="filter">
-        <label for="search-mode">Search Mode</label>
-        <select id="search-mode">
-          <option value="currentListFilter" selected>Current List Filter</option>
-          <option value="serverSearch">Server Search</option>
-        </select>
-        <label for="current-list-filter">Search</label>
-        <input id="current-list-filter" type="search" autocomplete="off">
-        <button type="button" id="server-search-submit" hidden>Search</button>
-      </div>
-    </div>
-    <section aria-label="Root Directory">
-      <table>
-        <thead>
-          <tr>
-            <th><button type="button" class="sort-button" data-sort-field="name">Name<span class="sort-direction" data-sort-indicator="name"></span></button></th>
-            <th>Kind</th>
-            <th><button type="button" class="sort-button" data-sort-field="size">Size<span class="sort-direction" data-sort-indicator="size"></span></button></th>
-            <th><button type="button" class="sort-button" data-sort-field="modifiedTime">Modified<span class="sort-direction" data-sort-indicator="modifiedTime"></span></button></th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="resources">
-          <tr><td colspan="5" class="muted">Loading</td></tr>
-        </tbody>
-      </table>
-    </section>
-    <dialog id="create-directory-dialog">
-      <form id="create-directory-form">
-        <h2>Create directory</h2>
-        <label for="create-directory-name">Directory name</label>
-        <input id="create-directory-name" name="name" maxlength="255" required autocomplete="off">
-        <div class="dialog-actions">
-          <button type="button" id="cancel-create-directory">Cancel</button>
-          <button type="submit" class="primary">Create</button>
-        </div>
-      </form>
-    </dialog>
-    <dialog id="rename-resource-dialog">
-      <form id="rename-resource-form">
-        <h2>Rename resource</h2>
-        <label for="rename-resource-name">Resource name</label>
-        <input id="rename-resource-name" name="name" maxlength="255" required autocomplete="off">
-        <div class="dialog-actions">
-          <button type="button" id="cancel-rename-resource">Cancel</button>
-          <button type="submit" class="primary">Rename</button>
-        </div>
-      </form>
-    </dialog>
-  </main>
-  <script>
-    (function () {
-      var resources = document.getElementById('resources');
-      var breadcrumb = document.getElementById('breadcrumb');
-      var returnToParent = document.getElementById('return-to-parent');
-      var searchMode = document.getElementById('search-mode');
-      var filter = document.getElementById('current-list-filter');
-      var serverSearchSubmit = document.getElementById('server-search-submit');
-      var identityUsername = document.getElementById('identity-username');
-      var loginAction = document.getElementById('login-action');
-      var passwordChangeAction = document.getElementById('password-change-action');
-      var logoutAction = document.getElementById('logout-action');
-      var consoleEntry = document.getElementById('console-entry');
-      var uploadFileAction = document.getElementById('upload-file-action');
-      var uploadFileInput = document.getElementById('upload-file-input');
-      var uploadDirectoryAction = document.getElementById('upload-directory-action');
-      var uploadDirectoryInput = document.getElementById('upload-directory-input');
-      var createDirectoryAction = document.getElementById('create-directory-action');
-      var createDirectoryDialog = document.getElementById('create-directory-dialog');
-      var createDirectoryForm = document.getElementById('create-directory-form');
-      var createDirectoryName = document.getElementById('create-directory-name');
-      var cancelCreateDirectory = document.getElementById('cancel-create-directory');
-      var renameResourceDialog = document.getElementById('rename-resource-dialog');
-      var renameResourceForm = document.getElementById('rename-resource-form');
-      var renameResourceName = document.getElementById('rename-resource-name');
-      var cancelRenameResource = document.getElementById('cancel-rename-resource');
-      var uploadProgress = document.getElementById('upload-progress');
-      var sortButtons = Array.prototype.slice.call(document.querySelectorAll('[data-sort-field]'));
-      var sortIndicators = Array.prototype.slice.call(document.querySelectorAll('[data-sort-indicator]'));
-      var state = {
-        path: '',
-        sort: 'name',
-        order: 'asc',
-        filter: '',
-        searchMode: 'currentListFilter',
-        canRename: false,
-        canDelete: false,
-        currentRows: [],
-        searchRows: [],
-        searchTruncated: false,
-        showingServerSearch: false,
-        renameResource: null,
-        renameSource: null
-      };
-
-      function text(value) {
-        return document.createTextNode(value == null ? '' : String(value));
-      }
-
-      function parentPath(path) {
-        var index = path.lastIndexOf('/');
-        if (index === -1) {
-          return '';
-        }
-        return path.slice(0, index);
-      }
-
-      function loadDirectory(path) {
-        state.path = path || '';
-        var query = [
-          'path=' + encodeURIComponent(state.path),
-          'sort=' + encodeURIComponent(state.sort),
-          'order=' + encodeURIComponent(state.order),
-          'filter=' + encodeURIComponent(state.filter)
-        ].join('&');
-
-        fetch('/api/list' + (query ? '?' + query : ''))
-          .then(function (response) {
-            return response.json().then(function (body) {
-              if (!response.ok) {
-                throw new Error(body.error && body.error.reason ? body.error.reason : 'Listing failed');
-              }
-              return body;
-            });
-          })
-          .then(function (body) {
-            state.path = body.path || '';
-            renderBreadcrumb(body.breadcrumbs || []);
-            renderParentAction();
-            renderSearchMode();
-            renderSort(body.sort || { field: state.sort, order: state.order });
-            state.currentRows = body.resources || [];
-            state.showingServerSearch = false;
-            renderRows(state.currentRows);
-          })
-          .catch(function (error) {
-            renderError(error.message);
-          });
-      }
-
-      function loadIdentity() {
-        fetch('/api/identity')
-          .then(function (response) {
-            if (!response.ok) {
-              throw new Error('Identity load failed');
-            }
-            return response.json();
-          })
-          .then(renderIdentity)
-          .catch(function () {
-            renderIdentity({
-              authenticated: false,
-              actions: { login: true, passwordChange: false, logout: false, console: false, upload: false, rename: false, delete: false }
-            });
-          });
-      }
-
-      function renderIdentity(identity) {
-        identityUsername.textContent = identity.authenticated ? identity.username : 'Anonymous';
-        loginAction.hidden = !identity.actions.login;
-        passwordChangeAction.hidden = !identity.actions.passwordChange;
-        logoutAction.hidden = !identity.actions.logout;
-        consoleEntry.hidden = !identity.actions.console;
-        uploadFileAction.hidden = !identity.actions.upload;
-        uploadDirectoryAction.hidden = !identity.actions.upload;
-        createDirectoryAction.hidden = !identity.actions.upload;
-        state.canRename = Boolean(identity.actions.rename);
-        state.canDelete = Boolean(identity.actions.delete);
-        if (state.showingServerSearch) {
-          renderSearchRows(state.searchRows, state.searchTruncated);
-        } else {
-          renderRows(state.currentRows);
-        }
-      }
-
-      function resetAfterWrite() {
-        state.filter = '';
-        state.searchMode = 'currentListFilter';
-        filter.value = '';
-        searchMode.value = state.searchMode;
-        renderSearchMode();
-        loadDirectory(state.path);
-      }
-
-      function uploadFile(file) {
-        var form = new FormData();
-        form.append('path', state.path);
-        form.append('file', file, file.name);
-        sendUpload(form, uploadFileInput);
-      }
-
-      function uploadDirectory(files) {
-        var form = new FormData();
-        form.append('path', state.path);
-        Array.prototype.forEach.call(files, function (file) {
-          form.append('relativePath', file.webkitRelativePath);
-          form.append('file', file, file.name);
-        });
-        sendUpload(form, uploadDirectoryInput);
-      }
-
-      function sendUpload(form, input) {
-        var request = new XMLHttpRequest();
-        request.open('POST', '/api/upload');
-        request.upload.onprogress = function (event) {
-          uploadProgress.hidden = false;
-          uploadProgress.value = event.lengthComputable && event.total
-            ? Math.round((event.loaded / event.total) * 100)
-            : 0;
-        };
-        request.onload = function () {
-          uploadProgress.hidden = true;
-          input.value = '';
-          if (request.status >= 200 && request.status < 300) {
-            resetAfterWrite();
-            return;
-          }
-          var body = {};
-          try {
-            body = JSON.parse(request.responseText);
-          } catch (_error) {
-            body = {};
-          }
-          if (body.error && body.error.reason) {
-            renderError(body.error.path ? body.error.path + ': ' + body.error.reason : body.error.reason);
-          } else {
-            renderError('Upload failed');
-          }
-        };
-        request.onerror = function () {
-          uploadProgress.hidden = true;
-          renderError('Upload failed');
-        };
-        request.send(form);
-      }
-
-      function submitRenameResource(event) {
-        event.preventDefault();
-        if (!state.renameResource) {
-          return;
-        }
-        fetch('/api/rename', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            path: state.renameResource.resourcePath,
-            newName: renameResourceName.value
-          })
-        }).then(function (response) {
-          if (response.ok) {
-            renameResourceDialog.close();
-            var renameSource = state.renameSource;
-            state.renameResource = null;
-            state.renameSource = null;
-            if (renameSource === 'serverSearch') {
-              runServerSearch();
-            } else {
-              resetAfterWrite();
-            }
-            return;
-          }
-          return response.json().then(function (body) {
-            var reason = body.error && body.error.reason ? body.error.reason : 'Rename failed';
-            var path = body.error && body.error.path ? body.error.path + ': ' : '';
-            throw new Error(path + reason);
-          });
-        }).catch(function (error) {
-          renderError(error.message);
-        });
-      }
-
-      function createDirectory() {
-        createDirectoryForm.reset();
-        createDirectoryDialog.showModal();
-        createDirectoryName.focus();
-      }
-
-      function submitCreateDirectory(event) {
-        event.preventDefault();
-        fetch('/api/mkdir', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ path: state.path, name: createDirectoryName.value })
-        }).then(function (response) {
-          if (response.ok) {
-            createDirectoryDialog.close();
-            resetAfterWrite();
-            return;
-          }
-          return response.json().then(function (body) {
-            throw new Error(body.error && body.error.reason ? body.error.reason : 'Create Directory failed');
-          });
-        }).catch(function (error) {
-          renderError(error.message);
-        });
-      }
-
-      function login() {
-        var username = window.prompt('Username');
-        if (!username) {
-          return;
-        }
-        var password = window.prompt('Password');
-        if (!password) {
-          return;
-        }
-        fetch('/api/login', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ username: username, password: password })
-        }).then(loadIdentity);
-      }
-
-      function changePassword() {
-        var oldPassword = window.prompt('Current password');
-        if (!oldPassword) {
-          return;
-        }
-        var newPassword = window.prompt('New password');
-        if (!newPassword) {
-          return;
-        }
-        fetch('/api/password', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ oldPassword: oldPassword, newPassword: newPassword })
-        }).then(loadIdentity);
-      }
-
-      function logout() {
-        fetch('/api/logout', { method: 'POST' }).then(loadIdentity);
-      }
-
-      function renderBreadcrumb(segments) {
-        breadcrumb.textContent = '';
-        segments.forEach(function (segment, index) {
-          if (index > 0) {
-            breadcrumb.appendChild(text('/'));
-          }
-          var button = document.createElement('button');
-          button.type = 'button';
-          button.appendChild(text(segment.label));
-          button.addEventListener('click', function () {
-            loadDirectory(segment.path);
-          });
-          breadcrumb.appendChild(button);
-        });
-      }
-
-      function renderParentAction() {
-        if (!state.path) {
-          returnToParent.hidden = true;
-          return;
-        }
-
-        returnToParent.hidden = false;
-      }
-
-      function downloadResource(resourcePath) {
-        window.location.assign('/api/download?path=' + encodeURIComponent(resourcePath));
-      }
-
-      function downloadDirectoryArchive(resourcePath) {
-        window.location.assign('/api/archive?path=' + encodeURIComponent(resourcePath));
-      }
-
-      function appendRenameAction(actions, resource, source) {
-        if (!state.canRename) {
-          return;
-        }
-        var rename = document.createElement('button');
-        rename.type = 'button';
-        rename.setAttribute('aria-label', 'Rename ' + resource.name);
-        rename.appendChild(text('Rename'));
-        rename.addEventListener('click', function () {
-          state.renameResource = resource;
-          state.renameSource = source;
-          renameResourceName.value = resource.name;
-          renameResourceDialog.showModal();
-          renameResourceName.focus();
-          renameResourceName.select();
-        });
-        actions.appendChild(rename);
-      }
-
-      function appendDeleteAction(actions, resource, source) {
-        if (!state.canDelete) {
-          return;
-        }
-        var deleteAction = document.createElement('button');
-        deleteAction.type = 'button';
-        deleteAction.setAttribute('aria-label', 'Delete ' + resource.name);
-        deleteAction.appendChild(text('Delete'));
-        deleteAction.addEventListener('click', function () {
-          deleteResource(resource, source);
-        });
-        actions.appendChild(deleteAction);
-      }
-
-      function deleteResource(resource, source) {
-        if (resource.kind === 'directory' &&
-            !window.confirm('Delete Directory "' + resource.name + '" and all contained Resources?')) {
-          return;
-        }
-        fetch('/api/delete', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ path: resource.resourcePath })
-        }).then(function (response) {
-          if (response.ok) {
-            if (source === 'serverSearch') {
-              runServerSearch();
-            } else {
-              resetAfterWrite();
-            }
-            return;
-          }
-          return response.json().then(function (body) {
-            var reason = body.error && body.error.reason ? body.error.reason : 'Delete failed';
-            var path = body.error && body.error.path ? body.error.path + ': ' : '';
-            throw new Error(path + reason);
-          });
-        }).catch(function (error) {
-          renderError(error.message);
-        });
-      }
-
-      function renderSearchMode() {
-        serverSearchSubmit.hidden = state.searchMode !== 'serverSearch';
-      }
-
-      function runServerSearch() {
-        fetch('/api/search?q=' + encodeURIComponent(state.filter))
-          .then(function (response) {
-            return response.json().then(function (body) {
-              if (!response.ok) {
-                throw new Error(body.error && body.error.reason ? body.error.reason : 'Search failed');
-              }
-              return body;
-            });
-          })
-          .then(function (body) {
-            state.searchRows = body.resources || [];
-            state.searchTruncated = Boolean(body.truncated);
-            state.showingServerSearch = true;
-            renderSearchRows(state.searchRows, state.searchTruncated);
-          })
-          .catch(function (error) {
-            renderError(error.message);
-          });
-      }
-
-      function renderSort(sort) {
-        state.sort = sort.field || state.sort;
-        state.order = sort.order || state.order;
-        sortIndicators.forEach(function (indicator) {
-          var field = indicator.getAttribute('data-sort-indicator');
-          indicator.textContent = field === state.sort ? state.order : '';
-        });
-      }
-
-      function renderSearchRows(rows, truncated) {
-        resources.textContent = '';
-        if (truncated) {
-          var truncatedRow = document.createElement('tr');
-          var truncatedCell = document.createElement('td');
-          truncatedCell.colSpan = 5;
-          truncatedCell.className = 'muted';
-          truncatedCell.appendChild(text('Search results truncated'));
-          truncatedRow.appendChild(truncatedCell);
-          resources.appendChild(truncatedRow);
-        }
-        if (!rows.length) {
-          var emptyRow = document.createElement('tr');
-          var emptyCell = document.createElement('td');
-          emptyCell.colSpan = 5;
-          emptyCell.className = 'muted';
-          emptyCell.appendChild(text('Empty'));
-          emptyRow.appendChild(emptyCell);
-          resources.appendChild(emptyRow);
-          return;
-        }
-
-        rows.forEach(function (row) {
-          var resource = row.resource;
-          var resultRow = document.createElement('tr');
-          var name = document.createElement('td');
-          name.className = 'name';
-          if (resource.kind === 'directory') {
-            var open = document.createElement('button');
-            open.type = 'button';
-            open.appendChild(text(resource.name));
-            open.addEventListener('click', function () {
-              loadDirectory(row.resource.resourcePath);
-            });
-            name.appendChild(open);
-          } else {
-            var download = document.createElement('button');
-            download.type = 'button';
-            download.appendChild(text(resource.name));
-            download.addEventListener('click', function () {
-              downloadResource(row.resource.resourcePath);
-            });
-            name.appendChild(download);
-          }
-          var kind = document.createElement('td');
-          kind.appendChild(text(resource.kind));
-          var size = document.createElement('td');
-          size.appendChild(text(resource.size));
-          var containingPath = document.createElement('td');
-          var containingPathButton = document.createElement('button');
-          containingPathButton.type = 'button';
-          containingPathButton.appendChild(text(row.containingPath || 'Root Directory'));
-          containingPathButton.addEventListener('click', function () {
-            loadDirectory(row.containingPath);
-          });
-          containingPath.appendChild(containingPathButton);
-          var actions = document.createElement('td');
-          if (resource.kind === 'directory') {
-            var archive = document.createElement('button');
-            archive.type = 'button';
-            archive.setAttribute('aria-label', 'Download archive for ' + resource.name);
-            archive.appendChild(text('Download archive'));
-            archive.addEventListener('click', function () {
-              downloadDirectoryArchive(row.resource.resourcePath);
-            });
-            actions.appendChild(archive);
-          }
-          appendRenameAction(actions, resource, 'serverSearch');
-          appendDeleteAction(actions, resource, 'serverSearch');
-          resultRow.appendChild(name);
-          resultRow.appendChild(kind);
-          resultRow.appendChild(size);
-          resultRow.appendChild(containingPath);
-          resultRow.appendChild(actions);
-          resources.appendChild(resultRow);
-        });
-      }
-
-      function renderRows(rows) {
-        resources.textContent = '';
-        if (!rows.length) {
-          var emptyRow = document.createElement('tr');
-          var emptyCell = document.createElement('td');
-          emptyCell.colSpan = 5;
-          emptyCell.className = 'muted';
-          emptyCell.appendChild(text('Empty'));
-          emptyRow.appendChild(emptyCell);
-          resources.appendChild(emptyRow);
-          return;
-        }
-
-        rows.forEach(function (resource) {
-          var row = document.createElement('tr');
-          var name = document.createElement('td');
-          name.className = 'name';
-          if (resource.kind === 'directory') {
-            var open = document.createElement('button');
-            open.type = 'button';
-            open.appendChild(text(resource.name));
-            open.addEventListener('click', function () {
-              loadDirectory(resource.resourcePath);
-            });
-            name.appendChild(open);
-          } else {
-            var download = document.createElement('button');
-            download.type = 'button';
-            download.appendChild(text(resource.name));
-            download.addEventListener('click', function () {
-              downloadResource(resource.resourcePath);
-            });
-            name.appendChild(download);
-          }
-          var kind = document.createElement('td');
-          kind.appendChild(text(resource.kind));
-          var size = document.createElement('td');
-          size.appendChild(text(resource.size));
-          var modified = document.createElement('td');
-          modified.appendChild(text(resource.modifiedTime));
-          var actions = document.createElement('td');
-          if (resource.kind === 'directory') {
-            var archive = document.createElement('button');
-            archive.type = 'button';
-            archive.setAttribute('aria-label', 'Download archive for ' + resource.name);
-            archive.appendChild(text('Download archive'));
-            archive.addEventListener('click', function () {
-              downloadDirectoryArchive(resource.resourcePath);
-            });
-            actions.appendChild(archive);
-          }
-          appendRenameAction(actions, resource, 'directoryListing');
-          appendDeleteAction(actions, resource, 'directoryListing');
-          row.appendChild(name);
-          row.appendChild(kind);
-          row.appendChild(size);
-          row.appendChild(modified);
-          row.appendChild(actions);
-          resources.appendChild(row);
-        });
-      }
-
-      function renderError(message) {
-        resources.textContent = '';
-        var row = document.createElement('tr');
-        var cell = document.createElement('td');
-        cell.colSpan = 5;
-        cell.className = 'error';
-        cell.appendChild(text(message));
-        row.appendChild(cell);
-        resources.appendChild(row);
-      }
-
-      returnToParent.addEventListener('click', function () {
-        loadDirectory(parentPath(state.path));
-      });
-      loginAction.addEventListener('click', login);
-      passwordChangeAction.addEventListener('click', changePassword);
-      logoutAction.addEventListener('click', logout);
-      uploadFileAction.addEventListener('click', function () {
-        uploadFileInput.click();
-      });
-      uploadFileInput.addEventListener('change', function () {
-        if (uploadFileInput.files && uploadFileInput.files.length === 1) {
-          uploadFile(uploadFileInput.files[0]);
-        }
-      });
-      uploadDirectoryAction.addEventListener('click', function () {
-        uploadDirectoryInput.click();
-      });
-      uploadDirectoryInput.addEventListener('change', function () {
-        if (uploadDirectoryInput.files && uploadDirectoryInput.files.length > 0) {
-          uploadDirectory(uploadDirectoryInput.files);
-        }
-      });
-      createDirectoryAction.addEventListener('click', createDirectory);
-      createDirectoryForm.addEventListener('submit', submitCreateDirectory);
-      renameResourceForm.addEventListener('submit', submitRenameResource);
-      cancelCreateDirectory.addEventListener('click', function () {
-        createDirectoryDialog.close();
-      });
-      cancelRenameResource.addEventListener('click', function () {
-        renameResourceDialog.close();
-      });
-
-      searchMode.addEventListener('change', function () {
-        state.searchMode = searchMode.value;
-        renderSearchMode();
-        if (state.searchMode === 'currentListFilter') {
-          loadDirectory(state.path);
-        }
-      });
-
-      filter.addEventListener('input', function () {
-        state.filter = filter.value;
-        if (state.searchMode === 'currentListFilter') {
-          loadDirectory(state.path);
-        }
-      });
-
-      serverSearchSubmit.addEventListener('click', function () {
-        runServerSearch();
-      });
-
-      sortButtons.forEach(function (button) {
-        button.addEventListener('click', function () {
-          var field = button.getAttribute('data-sort-field');
-          if (state.sort === field) {
-            state.order = state.order === 'asc' ? 'desc' : 'asc';
-          } else {
-            state.sort = field;
-            state.order = 'asc';
-          }
-          loadDirectory(state.path);
-        });
-      });
-
-      loadIdentity();
-      loadDirectory('');
-    }());
-  </script>
-</body>
-</html>
-"#;

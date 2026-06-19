@@ -1,0 +1,22 @@
+storage_root: /srv/file-hub/storage
+# Defaults to <storage_root>/.fh-staging/file-hub.sqlite when omitted.
+# database_path: /var/lib/file-hub/file-hub.sqlite
+staging_directory_name: .fh-staging
+
+server:
+  bind_address: 127.0.0.1:8080
+  time_zone: UTC
+
+limits:
+  request_body_limit_bytes: 134217728
+  request_concurrency_limit: 128
+  upload_single_file_size_limit_bytes: 10485760
+  upload_total_size_limit_bytes: 104857600
+  directory_upload_resource_count_limit: 10000
+  listing_direct_child_limit: 10000
+  archive_resource_count_limit: 100000
+  archive_uncompressed_size_limit_bytes: 10737418240
+  search_result_limit: 10000
+  search_traversal_limit: 1000000
+  request_timeout_seconds: 30
+  fs_concurrency_limit: 32
