@@ -109,6 +109,7 @@ pub async fn build_router_with_bootstrap_report(
         .route("/api/archive", get(download_directory_archive))
         .route("/api/mkdir", post(create_directory))
         .route("/api/rename", post(rename_resource))
+        .route("/api/delete", post(delete_resource))
         .route(
             "/api/upload",
             post(upload_file).layer(DefaultBodyLimit::max(upload_body_limit)),
@@ -204,6 +205,12 @@ struct CreateDirectoryRequest {
 struct RenameResourceRequest {
     path: String,
     new_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DeleteResourceRequest {
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -605,6 +612,20 @@ async fn rename_resource(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn delete_resource(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Result<StatusCode, ApiError> {
+    require_delete_permission(&state, request.headers()).await?;
+    let Json(request) = Json::<DeleteResourceRequest>::from_request(request, &state)
+        .await
+        .map_err(|_| ApiError::invalid_delete_request())?;
+    resource::delete_resource(&state.config, &request.path)
+        .await
+        .map_err(|error| ApiError::from_delete_error(error, &request.path))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn upload_file(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -765,6 +786,15 @@ async fn require_rename_permission(state: &AppState, headers: &HeaderMap) -> Res
     }
 }
 
+async fn require_delete_permission(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let permissions = effective_permissions(state, headers).await?;
+    if permissions.delete() {
+        Ok(())
+    } else {
+        Err(ApiError::delete_permission_required())
+    }
+}
+
 async fn effective_permissions(
     state: &AppState,
     headers: &HeaderMap,
@@ -875,7 +905,8 @@ impl From<resource::ResourceError> for ApiError {
                 reason: "resource path is not a file".to_owned(),
             },
             error @ (resource::ResourceError::RootDirectoryArchive
-            | resource::ResourceError::RootDirectoryRename) => {
+            | resource::ResourceError::RootDirectoryRename
+            | resource::ResourceError::RootDirectoryDelete) => {
                 Self::from_root_directory_error(&error)
             }
             resource::ResourceError::ResourceNotFound => Self {
@@ -884,28 +915,11 @@ impl From<resource::ResourceError> for ApiError {
                 path: None,
                 reason: "resource path does not exist".to_owned(),
             },
-            resource::ResourceError::ListingLimitExceeded { limit } => Self {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                code: "listing_limit_exceeded",
-                path: None,
-                reason: format!("direct child listing exceeds configured limit of {limit}"),
-            },
-            resource::ResourceError::ArchiveResourceCountLimitExceeded { limit } => Self {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                code: "archive_resource_count_limit_exceeded",
-                path: None,
-                reason: format!(
-                    "directory archive exceeds configured resource count limit of {limit}"
-                ),
-            },
-            resource::ResourceError::ArchiveSizeLimitExceeded { limit } => Self {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                code: "archive_size_limit_exceeded",
-                path: None,
-                reason: format!(
-                    "directory archive exceeds configured uncompressed size limit of {limit} bytes",
-                ),
-            },
+            error @ (resource::ResourceError::ListingLimitExceeded { .. }
+            | resource::ResourceError::ArchiveResourceCountLimitExceeded { .. }
+            | resource::ResourceError::ArchiveSizeLimitExceeded { .. }) => {
+                Self::from_resource_limit_error(&error)
+            }
             resource::ResourceError::InvalidResourceName => Self::invalid_resource_name(),
             error @ (resource::ResourceError::InvalidDirectoryUploadPath { .. }
             | resource::ResourceError::DirectoryUploadConflict { .. }
@@ -923,6 +937,16 @@ impl From<resource::ResourceError> for ApiError {
             | resource::ResourceError::UploadSingleFileSizeLimitExceeded { .. }
             | resource::ResourceError::UploadTotalSizeLimitExceeded { .. }
             | resource::ResourceError::StoreUpload(_)) => Self::from_write_error(&error),
+            resource::ResourceError::DeleteResource {
+                path,
+                operation,
+                source,
+            } => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "delete_failed",
+                path: Some(path),
+                reason: format!("failed to {operation}: {source}"),
+            },
             resource::ResourceError::ReadDirectory(_)
             | resource::ResourceError::ReadEntry(_)
             | resource::ResourceError::Metadata(_)
@@ -1005,6 +1029,32 @@ impl From<&ManagedUser> for ManagedUserResponse {
 }
 
 impl ApiError {
+    fn from_resource_limit_error(error: &resource::ResourceError) -> Self {
+        let (code, reason) = match error {
+            resource::ResourceError::ListingLimitExceeded { limit } => (
+                "listing_limit_exceeded",
+                format!("direct child listing exceeds configured limit of {limit}"),
+            ),
+            resource::ResourceError::ArchiveResourceCountLimitExceeded { limit } => (
+                "archive_resource_count_limit_exceeded",
+                format!("directory archive exceeds configured resource count limit of {limit}"),
+            ),
+            resource::ResourceError::ArchiveSizeLimitExceeded { limit } => (
+                "archive_size_limit_exceeded",
+                format!(
+                    "directory archive exceeds configured uncompressed size limit of {limit} bytes"
+                ),
+            ),
+            _ => return Self::internal_server_error(),
+        };
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code,
+            path: None,
+            reason,
+        }
+    }
+
     fn from_root_directory_error(error: &resource::ResourceError) -> Self {
         let (code, reason) = match error {
             resource::ResourceError::RootDirectoryArchive => (
@@ -1013,6 +1063,9 @@ impl ApiError {
             ),
             resource::ResourceError::RootDirectoryRename => {
                 ("root_directory_rename", "Root Directory cannot be renamed")
+            }
+            resource::ResourceError::RootDirectoryDelete => {
+                ("root_directory_delete", "Root Directory cannot be deleted")
             }
             _ => return Self::internal_server_error(),
         };
@@ -1027,6 +1080,14 @@ impl ApiError {
     fn from_rename_error(error: resource::ResourceError, path: &str) -> Self {
         let mut error = Self::from(error);
         error.path = Some(path.to_owned());
+        error
+    }
+
+    fn from_delete_error(error: resource::ResourceError, path: &str) -> Self {
+        let mut error = Self::from(error);
+        if error.path.is_none() {
+            error.path = Some(path.to_owned());
+        }
         error
     }
 
@@ -1192,12 +1253,30 @@ impl ApiError {
         }
     }
 
+    fn delete_permission_required() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "delete_permission_required",
+            path: None,
+            reason: "Delete Permission is required".to_owned(),
+        }
+    }
+
     fn invalid_rename_request() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_rename_request",
             path: None,
             reason: "Rename request is invalid".to_owned(),
+        }
+    }
+
+    fn invalid_delete_request() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_delete_request",
+            path: None,
+            reason: "Delete request is invalid".to_owned(),
         }
     }
 
@@ -1861,6 +1940,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         filter: '',
         searchMode: 'currentListFilter',
         canRename: false,
+        canDelete: false,
         currentRows: [],
         searchRows: [],
         searchTruncated: false,
@@ -1926,7 +2006,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           .catch(function () {
             renderIdentity({
               authenticated: false,
-              actions: { login: true, passwordChange: false, logout: false, console: false, upload: false, rename: false }
+              actions: { login: true, passwordChange: false, logout: false, console: false, upload: false, rename: false, delete: false }
             });
           });
       }
@@ -1941,6 +2021,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         uploadDirectoryAction.hidden = !identity.actions.upload;
         createDirectoryAction.hidden = !identity.actions.upload;
         state.canRename = Boolean(identity.actions.rename);
+        state.canDelete = Boolean(identity.actions.delete);
         if (state.showingServerSearch) {
           renderSearchRows(state.searchRows, state.searchTruncated);
         } else {
@@ -2158,6 +2239,48 @@ const INDEX_HTML: &str = r#"<!doctype html>
         actions.appendChild(rename);
       }
 
+      function appendDeleteAction(actions, resource, source) {
+        if (!state.canDelete) {
+          return;
+        }
+        var deleteAction = document.createElement('button');
+        deleteAction.type = 'button';
+        deleteAction.setAttribute('aria-label', 'Delete ' + resource.name);
+        deleteAction.appendChild(text('Delete'));
+        deleteAction.addEventListener('click', function () {
+          deleteResource(resource, source);
+        });
+        actions.appendChild(deleteAction);
+      }
+
+      function deleteResource(resource, source) {
+        if (resource.kind === 'directory' &&
+            !window.confirm('Delete Directory "' + resource.name + '" and all contained Resources?')) {
+          return;
+        }
+        fetch('/api/delete', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ path: resource.resourcePath })
+        }).then(function (response) {
+          if (response.ok) {
+            if (source === 'serverSearch') {
+              runServerSearch();
+            } else {
+              resetAfterWrite();
+            }
+            return;
+          }
+          return response.json().then(function (body) {
+            var reason = body.error && body.error.reason ? body.error.reason : 'Delete failed';
+            var path = body.error && body.error.path ? body.error.path + ': ' : '';
+            throw new Error(path + reason);
+          });
+        }).catch(function (error) {
+          renderError(error.message);
+        });
+      }
+
       function renderSearchMode() {
         serverSearchSubmit.hidden = state.searchMode !== 'serverSearch';
       }
@@ -2260,6 +2383,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             actions.appendChild(archive);
           }
           appendRenameAction(actions, resource, 'serverSearch');
+          appendDeleteAction(actions, resource, 'serverSearch');
           resultRow.appendChild(name);
           resultRow.appendChild(kind);
           resultRow.appendChild(size);
@@ -2321,6 +2445,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             actions.appendChild(archive);
           }
           appendRenameAction(actions, resource, 'directoryListing');
+          appendDeleteAction(actions, resource, 'directoryListing');
           row.appendChild(name);
           row.appendChild(kind);
           row.appendChild(size);
