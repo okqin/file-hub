@@ -156,42 +156,6 @@ async fn test_should_upload_file_atomically_into_current_resource_path() -> Resu
 }
 
 #[tokio::test]
-async fn test_should_render_upload_actions_progress_and_listing_refresh_behavior() -> Result<()> {
-    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
-    let (app, _config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .body(Body::empty())
-                .context("build browser request")?,
-        )
-        .await
-        .context("request browser page")?;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .context("read browser page")?;
-    let body = String::from_utf8(body.to_vec()).context("browser page must be UTF-8")?;
-
-    assert!(body.contains("id=\"upload-file-action\" hidden"));
-    assert!(body.contains("id=\"create-directory-action\" hidden"));
-    assert!(body.contains("id=\"create-directory-dialog\""));
-    assert!(body.contains("id=\"create-directory-form\""));
-    assert!(body.contains("id=\"upload-progress\""));
-    assert!(body.contains("new XMLHttpRequest()"));
-    assert!(body.contains("request.upload.onprogress"));
-    assert!(body.contains("uploadFileAction.hidden = !identity.actions.upload"));
-    assert!(body.contains("createDirectoryAction.hidden = !identity.actions.upload"));
-    assert!(body.contains("createDirectoryDialog.showModal()"));
-    assert!(body.contains("state.filter = ''"));
-    assert!(body.contains("state.searchMode = 'currentListFilter'"));
-    assert!(body.contains("loadDirectory(state.path)"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_should_reject_invalid_resource_names_for_create_directory() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
     let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;

@@ -1,8 +1,27 @@
-build:
+frontend-install:
+	@bun install --frozen-lockfile
+
+frontend-build:
+	@bun run build
+
+frontend-test:
+	@bun run test
+
+build: frontend-build
 	@cargo build
 
-test:
+test: frontend-test
 	@cargo nextest run --all-features
+
+package: frontend-build
+	@cargo build --release
+
+verify: frontend-test frontend-build
+	@cargo build
+	@cargo test
+	@cargo +nightly fmt -- --check
+	@cargo clippy --all-targets --all-features -- -D warnings
+	@cargo clippy --lib --bins --all-features -- -D warnings -W clippy::pedantic
 
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
@@ -30,4 +49,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test check-agent-sync release update-submodule
+.PHONY: frontend-install frontend-build frontend-test build test package verify check-agent-sync release update-submodule

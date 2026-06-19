@@ -5,73 +5,11 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use file_hub::{
-    auth::AuthState,
-    config::AppConfig,
-    http::{build_router, build_router_with_bootstrap_report},
-};
+use file_hub::{auth::AuthState, config::AppConfig, http::build_router_with_bootstrap_report};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions};
 use tempfile::TempDir;
 use tokio::fs;
 use tower::ServiceExt;
-
-#[tokio::test]
-async fn test_should_render_login_action_for_anonymous_identity_area() -> Result<()> {
-    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
-    let app = app_from_storage_root(storage_root.path()).await?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .body(Body::empty())
-                .context("build browser request")?,
-        )
-        .await
-        .context("send browser request")?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .context("read browser response body")?;
-    let body = String::from_utf8(body.to_vec()).context("browser body must be UTF-8")?;
-
-    assert!(body.contains("aria-label=\"Identity Area\""));
-    assert!(body.contains("id=\"login-action\""));
-    assert!(body.contains("Login"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_should_render_browser_identity_controls_for_authenticated_users_and_admin()
--> Result<()> {
-    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
-    let app = app_from_storage_root(storage_root.path()).await?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .body(Body::empty())
-                .context("build browser request")?,
-        )
-        .await
-        .context("send browser request")?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .context("read browser response body")?;
-    let body = String::from_utf8(body.to_vec()).context("browser body must be UTF-8")?;
-
-    assert!(body.contains("fetch('/api/identity'"));
-    assert!(body.contains("id=\"password-change-action\""));
-    assert!(body.contains("id=\"logout-action\""));
-    assert!(body.contains("id=\"console-entry\""));
-    assert!(body.contains("function renderIdentity(identity)"));
-    assert!(body.contains("identity.actions.console"));
-    Ok(())
-}
 
 #[tokio::test]
 async fn test_should_create_admin_bootstrap_password_on_first_startup() -> Result<()> {
@@ -748,12 +686,8 @@ async fn test_should_allow_only_administrator_to_access_console_api_and_view() -
         .await
         .context("read console view body")?;
     let body = String::from_utf8(body.to_vec()).context("console view must be UTF-8")?;
-    assert!(body.contains("aria-label=\"Console\""));
-    assert!(body.contains("id=\"create-user-action\""));
-    assert!(body.contains("id=\"anonymous-upload-permission\""));
-    assert!(body.contains("/api/console/users/${encodeURIComponent(username)}/permissions"));
-    assert!(body.contains("Reset password"));
-    assert!(body.contains("loadConsole().catch"));
+    assert!(body.contains("<div id=\"app\"></div>"));
+    assert!(body.contains("nomodule"));
     Ok(())
 }
 
@@ -1350,11 +1284,6 @@ async fn test_should_revoke_user_sessions_when_admin_resets_password_or_deletes_
         .context("send deleted user login request")?;
     assert_eq!(deleted_login.status(), StatusCode::UNAUTHORIZED);
     Ok(())
-}
-
-async fn app_from_storage_root(storage_root: &Path) -> Result<axum::Router> {
-    let config = config_from_storage_root(storage_root).await?;
-    build_router(config).await.context("build app router")
 }
 
 async fn config_from_storage_root(storage_root: &Path) -> Result<AppConfig> {
