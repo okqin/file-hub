@@ -1398,7 +1398,7 @@ async fn normalize_framework_error(response: Response) -> Response {
 
 async fn spa_fallback(uri: Uri) -> Result<Response, ApiError> {
     let path = uri.path().trim_start_matches('/');
-    if uri.path().starts_with("/api/") {
+    if uri.path() == "/api" || uri.path().starts_with("/api/") {
         return Err(ApiError::not_found());
     }
     if path.starts_with("assets/") {

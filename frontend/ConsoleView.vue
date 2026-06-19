@@ -100,9 +100,9 @@ onMounted(async () => {
         <form id="create-user-form" class="console-form" @submit.prevent="createUser">
           <label>Username <input id="new-username" v-model="newUser.username" required maxlength="64"></label>
           <label>Password <input id="new-password" v-model="newUser.password" type="password" required minlength="8" maxlength="256"></label>
-          <label><input id="new-upload" v-model="newUser.permissions.upload" type="checkbox"> Upload</label>
-          <label><input v-model="newUser.permissions.rename" type="checkbox"> Rename</label>
-          <label><input v-model="newUser.permissions.delete" type="checkbox"> Delete</label>
+          <label class="checkbox-label"><input id="new-upload" v-model="newUser.permissions.upload" type="checkbox"> Upload</label>
+          <label class="checkbox-label"><input v-model="newUser.permissions.rename" type="checkbox"> Rename</label>
+          <label class="checkbox-label"><input v-model="newUser.permissions.delete" type="checkbox"> Delete</label>
           <button class="primary" type="submit">Create user</button>
         </form>
         <article v-for="user in users" :key="user.username" class="user-row">
@@ -123,12 +123,13 @@ onMounted(async () => {
 .console-shell { min-height: 100vh; background: #f4f5f7; color: #202124; }
 header { min-height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; background: white; border-bottom: 1px solid #d9dde3; }
 h1 { font-size: 19px; }
-main { width: min(1200px, 100%); margin: auto; padding: 24px; }
+main { width: 100%; max-width: 1200px; margin: auto; padding: 24px; }
 section { padding: 18px 0; border-top: 1px solid #d9dde3; }
 h2 { font-size: 16px; }
-.console-form, .user-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 0; }
-.console-form label { display: grid; gap: 4px; }
-.console-form label:has(input[type="checkbox"]) { display: flex; }
+.console-form, .user-row { display: flex; flex-wrap: wrap; align-items: center; padding: 12px 0; }
+.console-form > *, .user-row > * { margin-right: 10px; margin-bottom: 10px; }
+.console-form label { display: grid; grid-row-gap: 4px; }
+.console-form .checkbox-label { display: flex; }
 input { min-height: 34px; padding: 6px 8px; border: 1px solid #aeb4bd; }
 button { border: 1px solid #aeb4bd; background: white; padding: 7px 10px; cursor: pointer; }
 .primary { color: white; background: #1769aa; }

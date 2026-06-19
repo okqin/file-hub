@@ -282,9 +282,8 @@ onMounted(async () => {
         <button type="button" @click="renameTarget = null">Cancel</button>
       </form>
       <nav aria-label="Breadcrumb">
-        <button type="button" @click="openDirectory('')">Root Directory</button>
         <template v-for="breadcrumb in listing.breadcrumbs" :key="breadcrumb.path">
-          <span>/</span>
+          <span v-if="breadcrumb.path">/</span>
           <button type="button" @click="openDirectory(breadcrumb.path)">{{ breadcrumb.label }}</button>
         </template>
       </nav>
@@ -382,7 +381,8 @@ select { min-height: 36px; font: inherit; }
 button, a { color: #1769aa; }
 button { border: 0; background: transparent; cursor: pointer; padding: 4px; }
 .primary { background: #1769aa; color: #fff; padding: 8px 14px; }
-.actions-bar { display: flex; gap: 8px; margin: 14px 0; }
+.actions-bar { display: flex; margin: 14px 0; }
+.actions-bar > * { margin-right: 8px; }
 .actions-bar button { border: 1px solid #aeb4bd; padding: 7px 10px; }
 header {
   min-height: 58px;
@@ -393,17 +393,21 @@ header {
   background: #fff;
   border-bottom: 1px solid #d9dde3;
 }
-header [aria-label="Identity Area"] { display: flex; align-items: center; gap: 10px; }
+header [aria-label="Identity Area"] { display: flex; align-items: center; }
+header [aria-label="Identity Area"] > * { margin-left: 10px; }
 h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
-main { width: min(1200px, 100%); margin: 0 auto; padding: 24px; }
-.login { display: flex; align-items: end; gap: 12px; padding: 14px 0 20px; }
-.login label { display: grid; gap: 5px; font-size: 13px; }
+main { width: 100%; max-width: 1200px; margin: 0 auto; padding: 24px; }
+.login { display: flex; align-items: flex-end; padding: 14px 0 20px; }
+.login > * { margin-right: 12px; }
+.login label { display: grid; grid-row-gap: 5px; font-size: 13px; }
 .login input { min-height: 36px; padding: 7px 9px; border: 1px solid #aeb4bd; }
-.toolbar { display: flex; align-items: end; gap: 10px; margin: 14px 0; }
-.toolbar label { display: grid; gap: 5px; font-size: 13px; }
-.toolbar input { width: min(340px, 70vw); min-height: 36px; padding: 7px 9px; border: 1px solid #aeb4bd; }
+.toolbar { display: flex; align-items: flex-end; margin: 14px 0; }
+.toolbar > * { margin-right: 10px; }
+.toolbar label { display: grid; grid-row-gap: 5px; font-size: 13px; }
+.toolbar input { width: 70vw; max-width: 340px; min-height: 36px; padding: 7px 9px; border: 1px solid #aeb4bd; }
 .notice { color: #7a4b00; }
-nav { display: flex; align-items: center; gap: 4px; min-height: 32px; }
+nav { display: flex; align-items: center; min-height: 32px; }
+nav > * { margin-right: 4px; }
 .table-wrap { overflow-x: auto; border: 1px solid #d9dde3; background: #fff; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 11px 12px; border-bottom: 1px solid #e3e6ea; text-align: left; white-space: nowrap; }
@@ -412,5 +416,6 @@ tbody tr:last-child td { border-bottom: 0; }
 @media (max-width: 640px) {
   header, main { padding-left: 14px; padding-right: 14px; }
   .login { align-items: stretch; flex-direction: column; }
+  .login > * { margin-right: 0; margin-bottom: 12px; }
 }
 </style>

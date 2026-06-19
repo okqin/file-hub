@@ -210,6 +210,46 @@ async fn test_should_serve_embedded_spa_and_static_assets_from_rust_router() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn test_should_return_unified_not_found_for_entire_api_namespace() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let config_directory = tempfile::tempdir().context("create temporary config directory")?;
+    let config_path = config_directory.path().join("file-hub.yaml");
+    tokio::fs::write(&config_path, config_yaml(storage_root.path(), 4096, 8, 4))
+        .await
+        .context("write test configuration")?;
+    let config = AppConfig::load_from_path(&config_path)
+        .await
+        .context("load test configuration")?;
+    let app = build_router(config).await.context("build HTTP router")?;
+
+    for uri in ["/api", "/api/unknown"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(uri)
+                    .body(Body::empty())
+                    .context("build unknown API request")?,
+            )
+            .await
+            .context("request unknown API route")?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("application/json")),
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .context("read unknown API error")?;
+        let body: Value = serde_json::from_slice(&body).context("decode unknown API error")?;
+        assert_eq!(
+            body.pointer("/error/code"),
+            Some(&Value::String("not_found".to_owned())),
+        );
+    }
+    Ok(())
+}
+
 fn first_asset_path(index: &str) -> Option<&str> {
     let marker = "\"/assets/";
     let start = index.find(marker)?.checked_add(1)?;

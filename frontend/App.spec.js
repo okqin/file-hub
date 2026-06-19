@@ -20,7 +20,7 @@ describe('File Hub browser', () => {
         path: '',
         sort: { field: 'name', order: 'asc' },
         filter: { query: '' },
-        breadcrumbs: [],
+        breadcrumbs: [{ label: 'Root Directory', path: '' }],
         resources: [
           { name: 'docs', resourcePath: 'docs', kind: 'directory', modifiedTime: '2026-06-19 09:00:00' },
           { name: 'readme.txt', resourcePath: 'readme.txt', kind: 'file', size: 5, modifiedTime: '2026-06-19 09:01:00' },
@@ -34,6 +34,7 @@ describe('File Hub browser', () => {
     expect(wrapper.get('#login-action').text()).toBe('Login')
     expect(wrapper.text()).toContain('docs')
     expect(wrapper.text()).toContain('readme.txt')
+    expect(wrapper.get('nav[aria-label="Breadcrumb"]').text()).toBe('Root Directory')
     expect(fetch).toHaveBeenCalledWith('/api/identity')
     expect(fetch).toHaveBeenCalledWith('/api/list?path=&sort=name&order=asc&filter=')
   })
