@@ -181,7 +181,7 @@ async fn test_should_reject_multiple_top_level_files_in_one_upload_request() -> 
 }
 
 #[tokio::test]
-async fn test_should_reject_invalid_resource_names_for_create_directory() -> Result<()> {
+async fn test_should_map_invalid_resource_name_for_create_directory() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
     let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
     let auth = AuthState::connect_existing(config.database_path())
@@ -190,30 +190,15 @@ async fn test_should_reject_invalid_resource_names_for_create_directory() -> Res
     auth.set_anonymous_permissions(PermissionSet::new(true, false, false))
         .await
         .context("grant anonymous Upload Permission")?;
-    let invalid_names = [
-        String::new(),
-        ".".to_owned(),
-        "..".to_owned(),
-        "nested/name".to_owned(),
-        "nested\\name".to_owned(),
-        "nul\0name".to_owned(),
-        "control\nname".to_owned(),
-        ".fh-staging".to_owned(),
-        "x".repeat(256),
-    ];
+    let response = app
+        .oneshot(json_request(
+            "/api/mkdir",
+            &serde_json::json!({ "path": "", "name": "nested/name" }),
+        )?)
+        .await
+        .context("send invalid Resource Name")?;
 
-    for name in invalid_names {
-        let response = app
-            .clone()
-            .oneshot(json_request(
-                "/api/mkdir",
-                &serde_json::json!({ "path": "", "name": name }),
-            )?)
-            .await
-            .context("send invalid Resource Name")?;
-        assert_error(response, StatusCode::BAD_REQUEST, "invalid_resource_name").await?;
-    }
-    Ok(())
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_resource_name").await
 }
 
 #[tokio::test]
@@ -306,26 +291,13 @@ async fn test_should_enforce_single_file_and_total_upload_limits() -> Result<()>
 }
 
 #[tokio::test]
-async fn test_should_reject_invalid_resource_names_for_file_upload() -> Result<()> {
+async fn test_should_map_invalid_resource_name_for_file_upload() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
     let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
     grant_anonymous_upload_permission(&config).await?;
-    let invalid_names = [
-        String::new(),
-        ".".to_owned(),
-        "..".to_owned(),
-        "nested/name".to_owned(),
-        "nested\\name".to_owned(),
-        "nul\0name".to_owned(),
-        "control\nname".to_owned(),
-        ".fh-staging".to_owned(),
-        "x".repeat(256),
-    ];
+    let response = upload_request(app, "nested/name", b"content").await?;
 
-    for name in invalid_names {
-        let response = upload_request(app.clone(), &name, b"content").await?;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     Ok(())
 }
 

@@ -179,37 +179,23 @@ async fn test_should_treat_same_resource_name_as_successful_noop() -> Result<()>
 }
 
 #[tokio::test]
-async fn test_should_reject_invalid_new_resource_names_without_expressing_move() -> Result<()> {
+async fn test_should_map_invalid_new_resource_name_without_expressing_move() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
     fs::write(storage_root.path().join("original.txt"), b"content")
         .await
         .context("write original File")?;
     let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
     grant_anonymous_rename_permission(&config).await?;
-    let invalid_names = vec![
-        String::new(),
-        ".".to_owned(),
-        "..".to_owned(),
-        "nested/name.txt".to_owned(),
-        "nested\\name.txt".to_owned(),
-        "nul\0name.txt".to_owned(),
-        "control\nname.txt".to_owned(),
-        ".fh-staging".to_owned(),
-        "x".repeat(256),
-    ];
-
-    for new_name in invalid_names {
-        let response = rename_request(app.clone(), "original.txt", &new_name).await?;
-        assert_write_error(
-            response,
-            StatusCode::BAD_REQUEST,
-            "invalid_resource_name",
-            "original.txt",
-            "Resource Name is invalid",
-        )
-        .await?;
-        assert!(storage_root.path().join("original.txt").exists());
-    }
+    let response = rename_request(app, "original.txt", "nested/name.txt").await?;
+    assert_write_error(
+        response,
+        StatusCode::BAD_REQUEST,
+        "invalid_resource_name",
+        "original.txt",
+        "Resource Name is invalid",
+    )
+    .await?;
+    assert!(storage_root.path().join("original.txt").exists());
     Ok(())
 }
 

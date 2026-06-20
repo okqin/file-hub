@@ -26,12 +26,12 @@ use tokio::{
 };
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::config::AppConfig;
+use crate::{
+    config::AppConfig,
+    resource_address::{ResourceName, ResourcePath},
+};
 
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
-const MAX_RESOURCE_NAME_BYTES: usize = 255;
-pub(crate) const MAX_RESOURCE_PATH_BYTES: usize = 4096;
-const MAX_RESOURCE_PATH_SEGMENTS: usize = 256;
 
 /// Root directory listing response.
 #[derive(Debug, Serialize)]
@@ -282,22 +282,19 @@ pub async fn create_directory(
     path: &str,
     name: &str,
 ) -> Result<(), ResourceError> {
-    let resource_path = ResourcePath::parse(path)?;
-    if resource_path.contains_reserved_name(config.staging_directory_name()) {
-        return Err(ResourceError::InvalidResourcePath);
-    }
-    if !is_valid_resource_name(name) || name == config.staging_directory_name() {
-        return Err(ResourceError::InvalidWriteResourceName);
-    }
+    let resource_path = parse_user_path(config, path)?;
+    let name = parse_user_name(config, name)?;
+    resource_path
+        .join(&name)
+        .map_err(|_| ResourceError::InvalidResourcePath)?;
 
     let storage_root = config.storage_root().to_path_buf();
-    let segments = owned_segments(&resource_path);
-    let name = name.to_owned();
+    let segments = resource_path.segments().to_vec();
     task::spawn_blocking(move || {
         let root = Dir::open_ambient_dir(storage_root, ambient_authority())
             .map_err(ResourceError::CreateDirectory)?;
         let parent = open_relative_directory(&root, &segments)?;
-        match parent.create_dir(name) {
+        match parent.create_dir(name.as_str()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(ResourceError::NameConflict)
@@ -321,30 +318,27 @@ pub async fn rename_resource(
     path: &str,
     new_name: &str,
 ) -> Result<(), ResourceError> {
-    let resource_path = ResourcePath::parse(path)?;
-    if resource_path.contains_reserved_name(config.staging_directory_name()) {
-        return Err(ResourceError::InvalidResourcePath);
-    }
-    if !is_valid_resource_name(new_name) || new_name == config.staging_directory_name() {
-        return Err(ResourceError::InvalidWriteResourceName);
-    }
-    let Some((source_name, parent_segments)) = resource_path.segments.split_last() else {
+    let resource_path = parse_user_path(config, path)?;
+    let new_name = parse_user_name(config, new_name)?;
+    let Some((source_name, parent_segments)) = resource_path.segments().split_last() else {
         return Err(ResourceError::RootDirectoryRename);
     };
+    let parent_path = resource_path
+        .parent()
+        .ok_or(ResourceError::RootDirectoryRename)?;
+    parent_path
+        .join(&new_name)
+        .map_err(|_| ResourceError::InvalidWriteResourceName)?;
 
     let storage_root = config.storage_root().to_path_buf();
-    let parent_segments = parent_segments
-        .iter()
-        .map(|segment| (*segment).to_owned())
-        .collect::<Vec<_>>();
-    let source_name = (*source_name).to_owned();
-    let new_name = new_name.to_owned();
+    let parent_segments = parent_segments.to_vec();
+    let source_name = source_name.clone();
     task::spawn_blocking(move || {
         let root = Dir::open_ambient_dir(storage_root, ambient_authority())
             .map_err(ResourceError::RenameResource)?;
         let parent = open_relative_directory(&root, &parent_segments)?;
         let metadata = parent
-            .symlink_metadata(&source_name)
+            .symlink_metadata(source_name.as_str())
             .map_err(map_resolve_error)?;
         if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
             return Err(ResourceError::InvalidResourcePath);
@@ -352,7 +346,7 @@ pub async fn rename_resource(
         if source_name == new_name {
             return Ok(());
         }
-        match rename_noreplace(&parent, &source_name, &parent, &new_name) {
+        match rename_noreplace(&parent, source_name.as_str(), &parent, new_name.as_str()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(ResourceError::NameConflict)
@@ -375,20 +369,14 @@ pub async fn rename_resource(
 /// Returns an error when the Resource Path is invalid, the target is not a regular File or
 /// Directory, or the target cannot be removed.
 pub async fn delete_resource(config: &AppConfig, path: &str) -> Result<(), ResourceError> {
-    let resource_path = ResourcePath::parse(path)?;
-    if resource_path.contains_reserved_name(config.staging_directory_name()) {
-        return Err(ResourceError::InvalidResourcePath);
-    }
-    let Some((target_name, parent_segments)) = resource_path.segments.split_last() else {
+    let resource_path = parse_user_path(config, path)?;
+    let Some((target_name, parent_segments)) = resource_path.segments().split_last() else {
         return Err(ResourceError::RootDirectoryDelete);
     };
 
     let storage_root = config.storage_root().to_path_buf();
-    let parent_segments = parent_segments
-        .iter()
-        .map(|segment| (*segment).to_owned())
-        .collect::<Vec<_>>();
-    let target_name = (*target_name).to_owned();
+    let parent_segments = parent_segments.to_vec();
+    let target_name = target_name.clone();
     let requested_path = path.to_owned();
     let task_path = requested_path.clone();
     task::spawn_blocking(move || {
@@ -396,19 +384,19 @@ pub async fn delete_resource(config: &AppConfig, path: &str) -> Result<(), Resou
             .map_err(|error| delete_failure(&task_path, "open storage root", error))?;
         let parent = open_relative_directory(&root, &parent_segments)?;
         let metadata = parent
-            .symlink_metadata(&target_name)
+            .symlink_metadata(target_name.as_str())
             .map_err(map_resolve_error)?;
         if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
             return Err(ResourceError::InvalidResourcePath);
         }
         if metadata.is_dir() {
-            remove_directory_resource(&parent, &target_name, &task_path, &metadata)?;
+            remove_directory_resource(&parent, target_name.as_str(), &task_path, &metadata)?;
         } else {
             parent
-                .remove_file(&target_name)
+                .remove_file(target_name.as_str())
                 .map_err(|error| delete_failure(&task_path, "delete File", error))?;
         }
-        match parent.symlink_metadata(&target_name) {
+        match parent.symlink_metadata(target_name.as_str()) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(delete_failure(&task_path, "verify deleted Resource", error)),
             Ok(_) => Err(delete_failure(
@@ -449,9 +437,36 @@ fn remove_directory_resource(
                 ),
             )
         })?;
-        let child_path = join_resource_path(resource_path, child_name);
+        let parent_path = ResourcePath::try_from(resource_path).map_err(|_| {
+            delete_failure(
+                resource_path,
+                "validate containing Resource Path",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Resource Path is invalid"),
+            )
+        })?;
+        let child_name = ResourceName::try_from(child_name).map_err(|_| {
+            delete_failure(
+                resource_path,
+                "validate child Resource Name",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Resource Name is invalid"),
+            )
+        })?;
+        let child_path = parent_path
+            .join(&child_name)
+            .map_err(|_| {
+                delete_failure(
+                    resource_path,
+                    "build child Resource Path",
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Resource Path exceeds configured limits",
+                    ),
+                )
+            })?
+            .as_str()
+            .to_owned();
         let metadata = directory
-            .symlink_metadata(child_name)
+            .symlink_metadata(child_name.as_str())
             .map_err(|error| delete_failure(&child_path, "read Resource metadata", error))?;
         if metadata.file_type().is_symlink() {
             return Err(delete_failure(
@@ -464,10 +479,10 @@ fn remove_directory_resource(
             ));
         }
         if metadata.is_dir() {
-            remove_directory_resource(&directory, child_name, &child_path, &metadata)?;
+            remove_directory_resource(&directory, child_name.as_str(), &child_path, &metadata)?;
         } else if metadata.is_file() {
             directory
-                .remove_file(child_name)
+                .remove_file(child_name.as_str())
                 .map_err(|error| delete_failure(&child_path, "delete File", error))?;
         } else {
             return Err(delete_failure(
@@ -530,27 +545,21 @@ fn delete_failure(path: &str, operation: &'static str, source: std::io::Error) -
     }
 }
 
-pub(crate) fn owned_segments(resource_path: &ResourcePath<'_>) -> Vec<String> {
-    resource_path
-        .segments
-        .iter()
-        .map(|segment| (*segment).to_owned())
-        .collect()
-}
-
 pub(crate) fn open_relative_directory(
     root: &Dir,
-    segments: &[String],
+    segments: &[ResourceName],
 ) -> Result<Dir, ResourceError> {
     let mut directory = root.try_clone().map_err(ResourceError::ReadDirectory)?;
     for segment in segments {
         let metadata = directory
-            .symlink_metadata(segment)
+            .symlink_metadata(segment.as_str())
             .map_err(map_resolve_error)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ResourceError::NotDirectory);
         }
-        directory = directory.open_dir(segment).map_err(map_resolve_error)?;
+        directory = directory
+            .open_dir(segment.as_str())
+            .map_err(map_resolve_error)?;
     }
     Ok(directory)
 }
@@ -614,10 +623,7 @@ pub async fn list_directory(
     sort: ListingSort,
     filter: CurrentListFilter,
 ) -> Result<DirectoryListing, ResourceError> {
-    let resource_path = ResourcePath::parse(path)?;
-    if resource_path.contains_reserved_name(config.staging_directory_name()) {
-        return Err(ResourceError::InvalidResourcePath);
-    }
+    let resource_path = parse_user_path(config, path)?;
     filter.validate()?;
     let directory_path = resolve_directory_path(config.storage_root(), &resource_path).await?;
 
@@ -632,13 +638,15 @@ pub async fn list_directory(
         .await
         .map_err(ResourceError::ReadEntry)?
     {
-        let name = entry
+        let raw_name = entry
             .file_name()
             .into_string()
             .map_err(|_| ResourceError::InvalidResourceName)?;
-        if name == config.staging_directory_name() {
+        if raw_name == config.staging_directory_name() {
             continue;
         }
+        let name = ResourceName::try_from(raw_name.as_str())
+            .map_err(|_| ResourceError::InvalidResourceName)?;
 
         let metadata = fs::symlink_metadata(entry.path())
             .await
@@ -656,10 +664,12 @@ pub async fn list_directory(
             continue;
         };
 
-        let child_path = resource_path.join_name(&name);
+        let child_path = resource_path
+            .join(&name)
+            .map_err(|_| ResourceError::InvalidResourcePath)?;
         resources.push(ResourceRow {
-            resource_path: child_path,
-            name,
+            resource_path: child_path.as_str().to_owned(),
+            name: raw_name,
             kind,
             size: (kind == ResourceKind::File).then_some(metadata.len()),
             modified_time: format_modified_time(
@@ -680,7 +690,7 @@ pub async fn list_directory(
         path: resource_path.as_str().to_owned(),
         sort,
         filter,
-        breadcrumbs: resource_path.breadcrumbs(),
+        breadcrumbs: breadcrumbs(&resource_path),
         resources,
     })
 }
@@ -692,11 +702,8 @@ pub async fn list_directory(
 /// Returns an error when the resource path is invalid, missing, outside the storage root, points
 /// at a Directory or symbolic link, or the file content cannot be opened.
 pub async fn download_file(config: &AppConfig, path: &str) -> Result<FileDownload, ResourceError> {
-    let resource_path = ResourcePath::parse(path)?;
-    if resource_path.as_str().is_empty() {
-        return Err(ResourceError::InvalidResourcePath);
-    }
-    if resource_path.contains_reserved_name(config.staging_directory_name()) {
+    let resource_path = parse_user_path(config, path)?;
+    if resource_path.is_root() {
         return Err(ResourceError::InvalidResourcePath);
     }
 
@@ -707,7 +714,11 @@ pub async fn download_file(config: &AppConfig, path: &str) -> Result<FileDownloa
         .map_err(ResourceError::ReadFile)?;
 
     Ok(FileDownload {
-        download_name: resource_path.file_name()?,
+        download_name: resource_path
+            .resource_name()
+            .ok_or(ResourceError::NotFile)?
+            .as_str()
+            .to_owned(),
         content_length,
         content,
     })
@@ -724,16 +735,17 @@ pub async fn download_directory_archive(
     config: &AppConfig,
     path: &str,
 ) -> Result<ArchiveDownload, ResourceError> {
-    let resource_path = ResourcePath::parse(path)?;
-    if resource_path.as_str().is_empty() {
+    let resource_path = parse_user_path(config, path)?;
+    if resource_path.is_root() {
         return Err(ResourceError::RootDirectoryArchive);
-    }
-    if resource_path.contains_reserved_name(config.staging_directory_name()) {
-        return Err(ResourceError::InvalidResourcePath);
     }
 
     let directory_path = resolve_directory_path(config.storage_root(), &resource_path).await?;
-    let directory_name = resource_path.file_name()?;
+    let directory_name = resource_path
+        .resource_name()
+        .ok_or(ResourceError::NotDirectory)?
+        .as_str()
+        .to_owned();
     let entries = collect_archive_entries(config, directory_path, directory_name.clone()).await?;
     let content = build_archive(entries).await?;
     let content_length =
@@ -760,7 +772,8 @@ pub async fn search_resources(
     let query = query.trim();
     let query_lowercase = query.to_lowercase();
     let mut resources = Vec::new();
-    let mut pending_directories = vec![(config.storage_root().to_path_buf(), String::new())];
+    let mut pending_directories =
+        vec![(config.storage_root().to_path_buf(), ResourcePath::default())];
     let result_limit = config.limits().search_result_limit().get();
     let traversal_limit = config.limits().search_traversal_limit().get();
     let mut traversed_resources = 0usize;
@@ -789,13 +802,15 @@ pub async fn search_resources(
             }
             traversed_resources += 1;
 
-            let name = entry
+            let raw_name = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| ResourceError::InvalidResourceName)?;
-            if name == config.staging_directory_name() {
+            if raw_name == config.staging_directory_name() {
                 continue;
             }
+            let name = ResourceName::try_from(raw_name.as_str())
+                .map_err(|_| ResourceError::InvalidResourceName)?;
 
             let metadata = fs::symlink_metadata(entry.path())
                 .await
@@ -812,9 +827,11 @@ pub async fn search_resources(
             } else {
                 continue;
             };
-            let resource_path = join_resource_path(&containing_path, &name);
+            let resource_path = containing_path
+                .join(&name)
+                .map_err(|_| ResourceError::InvalidResourcePath)?;
 
-            if name.to_lowercase().contains(&query_lowercase) {
+            if raw_name.to_lowercase().contains(&query_lowercase) {
                 if resources.len() == result_limit {
                     truncated = true;
                     pending_directories.clear();
@@ -823,8 +840,8 @@ pub async fn search_resources(
 
                 resources.push(SearchResultRow {
                     resource: ResourceRow {
-                        resource_path: resource_path.clone(),
-                        name: name.clone(),
+                        resource_path: resource_path.as_str().to_owned(),
+                        name: raw_name,
                         kind,
                         size: (kind == ResourceKind::File).then_some(metadata.len()),
                         modified_time: format_modified_time(
@@ -832,7 +849,7 @@ pub async fn search_resources(
                             config.server().time_zone(),
                         ),
                     },
-                    containing_path: containing_path.clone(),
+                    containing_path: containing_path.as_str().to_owned(),
                 });
             }
 
@@ -876,80 +893,40 @@ pub struct SearchResultRow {
     pub containing_path: String,
 }
 
-#[derive(Debug)]
-pub(crate) struct ResourcePath<'a> {
-    raw: &'a str,
-    pub(crate) segments: Vec<&'a str>,
+fn parse_user_path(config: &AppConfig, raw: &str) -> Result<ResourcePath, ResourceError> {
+    config
+        .resource_address_policy()
+        .parse_path(raw)
+        .map_err(|_| ResourceError::InvalidResourcePath)
 }
 
-impl<'a> ResourcePath<'a> {
-    pub(crate) fn parse(raw: &'a str) -> Result<Self, ResourceError> {
-        if raw.len() > MAX_RESOURCE_PATH_BYTES {
-            return Err(ResourceError::InvalidResourcePath);
+fn parse_user_name(config: &AppConfig, raw: &str) -> Result<ResourceName, ResourceError> {
+    config
+        .resource_address_policy()
+        .parse_name(raw)
+        .map_err(|_| ResourceError::InvalidWriteResourceName)
+}
+
+fn breadcrumbs(resource_path: &ResourcePath) -> Vec<BreadcrumbSegment> {
+    let mut breadcrumbs = Vec::with_capacity(resource_path.segments().len() + 1);
+    breadcrumbs.push(BreadcrumbSegment {
+        label: "Root Directory".to_owned(),
+        path: String::new(),
+    });
+
+    let mut path = String::new();
+    for segment in resource_path.segments() {
+        if !path.is_empty() {
+            path.push('/');
         }
-        if raw.is_empty() {
-            return Ok(Self {
-                raw,
-                segments: Vec::new(),
-            });
-        }
-
-        let segments: Vec<&str> = raw.split('/').collect();
-        if segments.len() > MAX_RESOURCE_PATH_SEGMENTS
-            || segments
-                .iter()
-                .any(|segment| !is_valid_resource_name(segment))
-        {
-            return Err(ResourceError::InvalidResourcePath);
-        }
-
-        Ok(Self { raw, segments })
-    }
-
-    fn as_str(&self) -> &str {
-        self.raw
-    }
-
-    fn join_name(&self, name: &str) -> String {
-        if self.raw.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{}/{name}", self.raw)
-        }
-    }
-
-    fn breadcrumbs(&self) -> Vec<BreadcrumbSegment> {
-        let mut breadcrumbs = Vec::with_capacity(self.segments.len() + 1);
+        path.push_str(segment.as_str());
         breadcrumbs.push(BreadcrumbSegment {
-            label: "Root Directory".to_owned(),
-            path: String::new(),
+            label: segment.as_str().to_owned(),
+            path: path.clone(),
         });
-
-        let mut path = String::new();
-        for segment in &self.segments {
-            if !path.is_empty() {
-                path.push('/');
-            }
-            path.push_str(segment);
-            breadcrumbs.push(BreadcrumbSegment {
-                label: (*segment).to_owned(),
-                path: path.clone(),
-            });
-        }
-
-        breadcrumbs
     }
 
-    pub(crate) fn contains_reserved_name(&self, reserved_name: &str) -> bool {
-        self.segments.contains(&reserved_name)
-    }
-
-    fn file_name(&self) -> Result<String, ResourceError> {
-        self.segments
-            .last()
-            .map(|name| (*name).to_owned())
-            .ok_or(ResourceError::NotFile)
-    }
+    breadcrumbs
 }
 
 #[derive(Debug)]
@@ -967,11 +944,11 @@ enum ArchiveEntryKind {
 
 async fn resolve_directory_path(
     storage_root: &std::path::Path,
-    resource_path: &ResourcePath<'_>,
+    resource_path: &ResourcePath,
 ) -> Result<PathBuf, ResourceError> {
     let mut path = storage_root.to_path_buf();
-    for segment in &resource_path.segments {
-        path.push(segment);
+    for segment in resource_path.segments() {
+        path.push(segment.as_str());
         let metadata = fs::symlink_metadata(&path)
             .await
             .map_err(map_resolve_error)?;
@@ -1024,6 +1001,8 @@ async fn collect_archive_entries(
             if name == config.staging_directory_name() {
                 continue;
             }
+            ResourceName::try_from(name.as_str())
+                .map_err(|_| ResourceError::InvalidResourceName)?;
 
             let metadata = fs::symlink_metadata(entry.path())
                 .await
@@ -1106,15 +1085,15 @@ async fn build_archive(entries: Vec<ArchiveEntry>) -> Result<Vec<u8>, ResourceEr
 
 async fn resolve_file_path(
     storage_root: &std::path::Path,
-    resource_path: &ResourcePath<'_>,
+    resource_path: &ResourcePath,
 ) -> Result<(PathBuf, u64), ResourceError> {
-    let Some((file_name, parent_segments)) = resource_path.segments.split_last() else {
+    let Some((file_name, parent_segments)) = resource_path.segments().split_last() else {
         return Err(ResourceError::NotFile);
     };
 
     let mut path = storage_root.to_path_buf();
     for segment in parent_segments {
-        path.push(segment);
+        path.push(segment.as_str());
         let metadata = fs::symlink_metadata(&path)
             .await
             .map_err(map_resolve_error)?;
@@ -1123,7 +1102,7 @@ async fn resolve_file_path(
         }
     }
 
-    path.push(file_name);
+    path.push(file_name.as_str());
     let metadata = fs::symlink_metadata(&path)
         .await
         .map_err(map_resolve_error)?;
@@ -1158,25 +1137,6 @@ fn validate_search_query(query: &str) -> Result<(), ResourceError> {
     }
 
     Ok(())
-}
-
-fn join_resource_path(containing_path: &str, name: &str) -> String {
-    if containing_path.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{containing_path}/{name}")
-    }
-}
-
-pub(crate) fn is_valid_resource_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_RESOURCE_NAME_BYTES
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
-        && !name.chars().any(char::is_control)
 }
 
 impl Default for ListingSort {

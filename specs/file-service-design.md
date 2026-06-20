@@ -27,7 +27,7 @@ axum + tower (router, body limit, timeout, rate limit, session)
 | 模块 | 职责 | 关键类型 |
 |------|------|----------|
 | `config` | 启动加载 YAML + `validator` 校验 | `AppConfig` |
-| `domain` | 边界 newtype 与纯规则 | `ResourcePath`, `ResourceName`, `Username`, `Password`, `PermissionSet` |
+| `resource_address` | Resource Path / Resource Name 与 reserved policy 的纯规则 | `ResourcePath`, `ResourceName`, `ResourceAddressPolicy` |
 | `storage` | SQLite 访问,迁移 | `Db`, 各 repo |
 | `auth` | 登录/会话/撤销、admin 引导 | `AuthUser`, `Backend` |
 | `resource` | FS 浏览/下载/归档/搜索/写 | 无状态 async fn |
@@ -38,8 +38,8 @@ axum + tower (router, body limit, timeout, rate limit, session)
 
 ## 3. 域 newtype(边界一次性校验)
 
-- **`ResourcePath`**:`TryFrom<&str>`,拒绝空、`.`/`..`、路径分隔符、NUL、控制字符、穿越;拒绝保留 staging 名。GET 类从 `?path=` 解析,写类从 JSON body 解析。解析后 `canonicalize` 并校验 `starts_with(storage_root)`;open 后对 symlink 再校验一次,symlink 在 `symlink_metadata` 层直接排除,不作为资源。
-- **`ResourceName`**:单段名,同上字符规则,用于 rename / create-directory / 上传 part。
+- **`ResourcePath`**:owned domain value；空路径唯一表示 Root Directory，非空路径由已验证的 Resource Name 段组成。路径相对 storage root，限制总 bytes 与段数。GET 类从 `?path=` 解析，写类从 JSON body 解析。解析后 `canonicalize` 并校验 `starts_with(storage_root)`；open 后对 symlink 再校验一次，symlink 在 `symlink_metadata` 层直接排除，不作为资源。
+- **`ResourceName`**:owned 单段名，拒绝空、`.`/`..`、路径分隔符、NUL、控制字符并限制 bytes，用于 rename / create-directory / 上传 part。保留 staging name 是独立 Hub policy，不属于 Resource Name 词法规则。
 - **`Username`**:ASCII 字母数字下划线连字符,`^[A-Za-z0-9_-]{1,64}$`,大小写不敏感唯一,保留原显示大小写。
 - **`Password`**:≥8 字符,无组成要求。
 - **`PermissionSet`**:`bitflags`,三独立位 `UPLOAD / RENAME / DELETE`,DB 存整数列。

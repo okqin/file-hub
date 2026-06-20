@@ -14,10 +14,8 @@ use tracing::warn;
 
 use crate::{
     config::AppConfig,
-    resource::{
-        ResourceError, ResourcePath, is_valid_resource_name, open_relative_directory,
-        owned_segments, rename_noreplace,
-    },
+    resource::{ResourceError, open_relative_directory, rename_noreplace},
+    resource_address::{ResourceAddressPolicy, ResourceName, ResourcePath},
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -90,7 +88,7 @@ struct StagedFileUpload {
     staging_directory: Dir,
     destination_directory: Dir,
     staging_name: String,
-    destination_name: String,
+    destination_name: ResourceName,
     cleanup_staging: bool,
     bytes_written: u64,
     single_file_limit: u64,
@@ -103,8 +101,8 @@ struct StagedDirectoryUpload {
     staged_tree: Dir,
     destination_directory: Dir,
     staging_name: String,
-    reserved_name: String,
-    top_level_name: Option<String>,
+    address_policy: ResourceAddressPolicy,
+    top_level_name: Option<ResourceName>,
     active_file: Option<File>,
     active_relative_path: Option<String>,
     cleanup_staging: bool,
@@ -112,7 +110,7 @@ struct StagedDirectoryUpload {
     total_bytes: u64,
     single_file_limit: u64,
     total_upload_limit: u64,
-    resource_paths: HashSet<String>,
+    resource_paths: HashSet<ResourcePath>,
     resource_count_limit: usize,
 }
 
@@ -284,17 +282,21 @@ impl UploadReceiver<'_> {
 
 impl StagedFileUpload {
     async fn start(config: &AppConfig, path: &str, name: &str) -> Result<Self, UploadError> {
-        let resource_path = ResourcePath::parse(path).map_err(UploadError::from_resource)?;
-        if resource_path.contains_reserved_name(config.staging_directory_name()) {
-            return Err(UploadError::InvalidResourcePath);
-        }
-        if !is_valid_resource_name(name) || name == config.staging_directory_name() {
-            return Err(UploadError::InvalidWriteResourceName);
-        }
+        let resource_path = config
+            .resource_address_policy()
+            .parse_path(path)
+            .map_err(|_| UploadError::InvalidResourcePath)?;
+        let destination_name = config
+            .resource_address_policy()
+            .parse_name(name)
+            .map_err(|_| UploadError::InvalidWriteResourceName)?;
+        resource_path
+            .join(&destination_name)
+            .map_err(|_| UploadError::InvalidResourcePath)?;
 
         let storage_root = config.storage_root().to_path_buf();
-        let segments = owned_segments(&resource_path);
-        let destination_name = name.to_owned();
+        let segments = resource_path.segments().to_vec();
+        let task_destination_name = destination_name.clone();
         let staging_directory_name = config.staging_directory_name().to_owned();
         let (file, staging_directory, destination_directory, staging_name) =
             task::spawn_blocking(move || {
@@ -302,7 +304,7 @@ impl StagedFileUpload {
                     .map_err(UploadError::Store)?;
                 let destination_directory = open_relative_directory(&root, &segments)
                     .map_err(UploadError::from_resource)?;
-                match destination_directory.symlink_metadata(&destination_name) {
+                match destination_directory.symlink_metadata(task_destination_name.as_str()) {
                     Ok(_) => return Err(UploadError::NameConflict),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(UploadError::Store(error)),
@@ -328,7 +330,7 @@ impl StagedFileUpload {
             staging_directory,
             destination_directory,
             staging_name,
-            destination_name: name.to_owned(),
+            destination_name,
             cleanup_staging: true,
             bytes_written: 0,
             single_file_limit: config.limits().upload_single_file_size_limit_bytes().get(),
@@ -378,7 +380,11 @@ impl StagedFileUpload {
         let staging_name = self.staging_name.clone();
         let destination_name = self.destination_name.clone();
         let publish = task::spawn_blocking(move || {
-            staging_directory.hard_link(&staging_name, &destination_directory, &destination_name)
+            staging_directory.hard_link(
+                &staging_name,
+                &destination_directory,
+                destination_name.as_str(),
+            )
         })
         .await
         .map_err(blocking_task_error)?;
@@ -426,13 +432,13 @@ impl Drop for StagedFileUpload {
 
 impl StagedDirectoryUpload {
     async fn start(config: &AppConfig, path: &str) -> Result<Self, UploadError> {
-        let resource_path = ResourcePath::parse(path).map_err(UploadError::from_resource)?;
-        if resource_path.contains_reserved_name(config.staging_directory_name()) {
-            return Err(UploadError::InvalidResourcePath);
-        }
+        let resource_path = config
+            .resource_address_policy()
+            .parse_path(path)
+            .map_err(|_| UploadError::InvalidResourcePath)?;
 
         let storage_root = config.storage_root().to_path_buf();
-        let segments = owned_segments(&resource_path);
+        let segments = resource_path.segments().to_vec();
         let staging_directory_name = config.staging_directory_name().to_owned();
         let (staging_directory, staged_tree, destination_directory, staging_name) =
             task::spawn_blocking(move || {
@@ -463,7 +469,7 @@ impl StagedDirectoryUpload {
             staged_tree,
             destination_directory,
             staging_name,
-            reserved_name: config.staging_directory_name().to_owned(),
+            address_policy: config.resource_address_policy().clone(),
             top_level_name: None,
             active_file: None,
             active_relative_path: None,
@@ -494,18 +500,16 @@ impl StagedDirectoryUpload {
         Ok(())
     }
 
-    fn validate_relative_path(&mut self, relative_path: &str) -> Result<Vec<String>, UploadError> {
-        let resource_path = ResourcePath::parse(relative_path).map_err(|_| {
+    fn validate_relative_path(
+        &mut self,
+        relative_path: &str,
+    ) -> Result<Vec<ResourceName>, UploadError> {
+        let resource_path = self.address_policy.parse_path(relative_path).map_err(|_| {
             UploadError::InvalidDirectoryUploadPath {
                 path: relative_path.to_owned(),
             }
         })?;
-        if resource_path.contains_reserved_name(&self.reserved_name) {
-            return Err(UploadError::InvalidDirectoryUploadPath {
-                path: relative_path.to_owned(),
-            });
-        }
-        let Some((top_level_name, nested_segments)) = resource_path.segments.split_first() else {
+        let Some((top_level_name, nested_segments)) = resource_path.segments().split_first() else {
             return Err(UploadError::InvalidDirectoryUploadPath {
                 path: relative_path.to_owned(),
             });
@@ -515,21 +519,22 @@ impl StagedDirectoryUpload {
                 path: relative_path.to_owned(),
             });
         }
-        match self.top_level_name.as_deref() {
-            Some(expected) if expected != *top_level_name => {
+        match self.top_level_name.as_ref() {
+            Some(expected) if expected != top_level_name => {
                 return Err(UploadError::InvalidDirectoryUploadPath {
                     path: relative_path.to_owned(),
                 });
             }
-            None => self.top_level_name = Some((*top_level_name).to_owned()),
+            None => self.top_level_name = Some(top_level_name.clone()),
             Some(_) => {}
         }
-        let mut cumulative_path = String::new();
-        for segment in &resource_path.segments {
-            if !cumulative_path.is_empty() {
-                cumulative_path.push('/');
-            }
-            cumulative_path.push_str(segment);
+        let mut cumulative_path = ResourcePath::default();
+        for segment in resource_path.segments() {
+            cumulative_path = cumulative_path.join(segment).map_err(|_| {
+                UploadError::InvalidDirectoryUploadPath {
+                    path: relative_path.to_owned(),
+                }
+            })?;
             if self.resource_paths.insert(cumulative_path.clone())
                 && self.resource_paths.len() > self.resource_count_limit
             {
@@ -539,15 +544,12 @@ impl StagedDirectoryUpload {
                 });
             }
         }
-        Ok(nested_segments
-            .iter()
-            .map(|segment| (*segment).to_owned())
-            .collect())
+        Ok(nested_segments.to_vec())
     }
 
     async fn create_staged_file(
         &self,
-        nested_segments: Vec<String>,
+        nested_segments: Vec<ResourceName>,
         failure_path: String,
     ) -> Result<File, UploadError> {
         let staged_tree = self.staged_tree.try_clone().map_err(UploadError::Store)?;
@@ -557,11 +559,11 @@ impl StagedDirectoryUpload {
             };
             let mut parent = staged_tree;
             for segment in parent_segments {
-                match parent.create_dir(segment) {
+                match parent.create_dir(segment.as_str()) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         let metadata = parent
-                            .symlink_metadata(segment)
+                            .symlink_metadata(segment.as_str())
                             .map_err(UploadError::Store)?;
                         if !metadata.is_dir() || metadata.file_type().is_symlink() {
                             return Err(UploadError::DirectoryUploadConflict {
@@ -571,7 +573,7 @@ impl StagedDirectoryUpload {
                     }
                     Err(error) => return Err(UploadError::Store(error)),
                 }
-                parent = parent.open_dir(segment).map_err(|error| {
+                parent = parent.open_dir(segment.as_str()).map_err(|error| {
                     if error.kind() == std::io::ErrorKind::NotADirectory {
                         UploadError::DirectoryUploadConflict {
                             path: failure_path.clone(),
@@ -584,7 +586,7 @@ impl StagedDirectoryUpload {
             let mut options = CapOpenOptions::new();
             options.write(true).create_new(true);
             parent
-                .open_with(file_name, &options)
+                .open_with(file_name.as_str(), &options)
                 .map(|file| File::from_std(file.into_std()))
                 .map_err(|error| {
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -659,7 +661,7 @@ impl StagedDirectoryUpload {
             .top_level_name
             .clone()
             .ok_or(UploadError::InvalidInput)?;
-        let conflict_path = destination_name.clone();
+        let conflict_path = destination_name.as_str().to_owned();
         let staging_directory = self
             .staging_directory
             .try_clone()
@@ -674,7 +676,7 @@ impl StagedDirectoryUpload {
                 &staging_directory,
                 &staging_name,
                 &destination_directory,
-                &destination_name,
+                destination_name.as_str(),
             )
             .map_err(|error| {
                 if matches!(

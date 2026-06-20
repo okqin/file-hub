@@ -13,12 +13,14 @@ use thiserror::Error;
 use tokio::fs;
 use validator::{Validate, ValidationError, ValidationErrors};
 
+use crate::resource_address::{ResourceAddressPolicy, ResourceName};
+
 /// Validated application configuration.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     storage_root: PathBuf,
     database_path: PathBuf,
-    staging_directory_name: String,
+    resource_address_policy: ResourceAddressPolicy,
     server: ServerConfig,
     limits: RuntimeLimits,
 }
@@ -260,9 +262,8 @@ impl AppConfig {
             return Err(AppConfigError::StorageRootNotDirectory);
         }
 
-        if !is_valid_resource_name(&raw.staging_directory_name) {
-            return Err(AppConfigError::InvalidStagingDirectoryName);
-        }
+        let staging_directory_name = ResourceName::try_from(raw.staging_directory_name.as_str())
+            .map_err(|_| AppConfigError::InvalidStagingDirectoryName)?;
 
         let server = ServerConfig {
             bind_address: raw
@@ -334,7 +335,7 @@ impl AppConfig {
                     .join("file-hub.sqlite")
             }),
             storage_root,
-            staging_directory_name: raw.staging_directory_name,
+            resource_address_policy: ResourceAddressPolicy::new(staging_directory_name),
             server,
             limits,
         })
@@ -355,7 +356,13 @@ impl AppConfig {
     /// Return the reserved staging directory name filtered from resource listings.
     #[must_use]
     pub fn staging_directory_name(&self) -> &str {
-        &self.staging_directory_name
+        self.resource_address_policy.reserved_name().as_str()
+    }
+
+    /// Return the policy that rejects internal Resource addresses at action seams.
+    #[must_use]
+    pub(crate) const fn resource_address_policy(&self) -> &ResourceAddressPolicy {
+        &self.resource_address_policy
     }
 
     /// Return server settings.
@@ -489,16 +496,6 @@ fn non_zero(value: usize, field: &'static str) -> Result<NonZeroUsize, AppConfig
 
 fn non_zero_u64(value: u64, field: &'static str) -> Result<NonZeroU64, AppConfigError> {
     NonZeroU64::new(value).ok_or(AppConfigError::ZeroLimit { field })
-}
-
-fn is_valid_resource_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
-        && !name.chars().any(char::is_control)
 }
 
 fn add_length_error(

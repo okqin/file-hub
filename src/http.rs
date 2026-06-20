@@ -26,7 +26,9 @@ use tracing::warn;
 use crate::{
     auth::{AuthError, AuthState, BootstrapPassword, BootstrapReport, ManagedUser, PermissionSet},
     config::AppConfig,
-    resource, upload,
+    resource,
+    resource_address::MAX_RESOURCE_PATH_BYTES,
+    upload,
 };
 
 const SESSION_COOKIE_NAME: &str = "fh_session";
@@ -741,7 +743,7 @@ async fn read_upload_path(field: &mut Field<'_>) -> Result<String, upload::Uploa
             .len()
             .checked_add(chunk.len())
             .ok_or(upload::UploadError::InvalidInput)?;
-        if next_length > resource::MAX_RESOURCE_PATH_BYTES {
+        if next_length > MAX_RESOURCE_PATH_BYTES {
             return Err(upload::UploadError::InvalidInput);
         }
         bytes.extend_from_slice(&chunk);
