@@ -156,6 +156,31 @@ async fn test_should_upload_file_atomically_into_current_resource_path() -> Resu
 }
 
 #[tokio::test]
+async fn test_should_reject_multiple_top_level_files_in_one_upload_request() -> Result<()> {
+    let storage_root = tempfile::tempdir().context("create temporary storage root")?;
+    let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
+    grant_anonymous_upload_permission(&config).await?;
+    let (content_type, body) = multipart_two_files();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/upload")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .context("build multiple File upload request")?,
+        )
+        .await
+        .context("send multiple File upload request")?;
+
+    assert_error(response, StatusCode::BAD_REQUEST, "invalid_upload_request").await?;
+    assert!(!storage_root.path().join("first.txt").exists());
+    assert!(!storage_root.path().join("second.txt").exists());
+    wait_for_staging_empty(storage_root.path()).await
+}
+
+#[tokio::test]
 async fn test_should_reject_invalid_resource_names_for_create_directory() -> Result<()> {
     let storage_root = tempfile::tempdir().context("create temporary storage root")?;
     let (app, config, _config_dir) = app_from_storage_root(storage_root.path()).await?;
@@ -654,6 +679,23 @@ fn multipart_file(path: &str, filename: &str, content: &[u8]) -> (String, Vec<u8
     .into_bytes();
     body.extend_from_slice(content);
     body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={BOUNDARY}"), body)
+}
+
+fn multipart_two_files() -> (String, Vec<u8>) {
+    const BOUNDARY: &str = "file-hub-multiple-files-boundary";
+    let body = format!(
+        concat!(
+            "--{0}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n\r\n",
+            "--{0}\r\nContent-Disposition: form-data; name=\"file\"; ",
+            "filename=\"first.txt\"\r\n\r\nfirst\r\n",
+            "--{0}\r\nContent-Disposition: form-data; name=\"file\"; ",
+            "filename=\"second.txt\"\r\n\r\nsecond\r\n",
+            "--{0}--\r\n",
+        ),
+        BOUNDARY,
+    )
+    .into_bytes();
     (format!("multipart/form-data; boundary={BOUNDARY}"), body)
 }
 

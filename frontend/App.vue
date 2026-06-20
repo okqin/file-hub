@@ -24,6 +24,10 @@ const renameSource = ref('directoryListing')
 const fileInput = ref(null)
 const directoryInput = ref(null)
 const uploadProgress = ref(0)
+const failedUploads = ref([])
+const uploadInProgress = ref(false)
+const MAX_CONCURRENT_UPLOADS = 3
+let nextUploadId = 0
 const visibleRows = computed(() => {
   if (searchMode.value === 'serverSearch') return searchResults.value
   return listing.value.resources.map(resource => ({ resource, containingPath: null }))
@@ -142,9 +146,117 @@ async function deleteResource(resource) {
   }
 }
 
-function uploadSelection(event, directory) {
+async function uploadSelection(event, directory) {
   const files = Array.from(event.target.files || [])
-  if (files.length === 0) return
+  if (files.length === 0 || uploadInProgress.value) return
+  uploadInProgress.value = true
+  try {
+    await performUploadSelection(files, directory)
+  } catch (error) {
+    status.value = error instanceof Error ? error.message : 'Upload failed'
+  } finally {
+    event.target.value = ''
+    uploadInProgress.value = false
+  }
+}
+
+async function performUploadSelection(files, directory) {
+  const uploads = directory ? [files] : files.map(file => [file])
+  failedUploads.value = []
+  const weights = uploads.map(uploadFiles => (
+    uploadFiles.reduce((total, file) => total + file.size, 0)
+  ))
+  const progressByUpload = uploads.map(() => 0)
+  const totalWeight = weights.reduce((total, weight) => total + weight, 0)
+  const updateProgress = (index, fraction) => {
+    progressByUpload[index] = fraction
+    const weightedProgress = totalWeight > 0
+      ? progressByUpload.reduce(
+        (total, progress, uploadIndex) => total + progress * weights[uploadIndex],
+        0,
+      ) / totalWeight
+      : progressByUpload.reduce((total, progress) => total + progress, 0) / uploads.length
+    uploadProgress.value = Math.round(weightedProgress * 100)
+  }
+  uploadProgress.value = 0
+  const results = await mapWithConcurrency(
+    uploads,
+    (uploadFiles, index) => uploadResource(
+      uploadFiles,
+      directory,
+      fraction => updateProgress(index, fraction),
+    ),
+  )
+  if (results.some(result => result.ok)) await refreshAfterWrite()
+  failedUploads.value = results.flatMap((result, index) => (
+    result.ok
+      ? []
+      : [{
+        id: nextUploadId++,
+        files: uploads[index],
+        directory,
+        name: uploadName(uploads[index], directory),
+        reason: result.reason,
+      }]
+  ))
+  status.value = failedUploads.value.length === 0
+    ? 'Upload complete'
+    : uploadFailureStatus(failedUploads.value)
+}
+
+function uploadName(files, directory) {
+  if (!directory) return files[0].name
+  return files[0].webkitRelativePath.split('/')[0]
+}
+
+function uploadFailureStatus(uploads) {
+  return `Upload failed: ${uploads.map(upload => `${upload.name}: ${upload.reason}`).join(', ')}`
+}
+
+async function retryUpload(upload) {
+  if (uploadInProgress.value) return
+  uploadInProgress.value = true
+  try {
+    uploadProgress.value = 0
+    const result = await uploadResource(upload.files, upload.directory, fraction => {
+      uploadProgress.value = Math.round(fraction * 100)
+    })
+    if (!result.ok) {
+      upload.reason = result.reason
+      status.value = uploadFailureStatus(failedUploads.value)
+      return
+    }
+    failedUploads.value = failedUploads.value.filter(candidate => candidate !== upload)
+    await refreshAfterWrite()
+    status.value = failedUploads.value.length === 0
+      ? 'Upload complete'
+      : uploadFailureStatus(failedUploads.value)
+  } catch (error) {
+    status.value = error instanceof Error ? error.message : 'Upload failed'
+  } finally {
+    uploadInProgress.value = false
+  }
+}
+
+async function mapWithConcurrency(items, worker) {
+  const results = new Array(items.length)
+  let nextIndex = 0
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex
+      nextIndex += 1
+      results[index] = await worker(items[index], index)
+    }
+  }
+  const workers = Array.from(
+    { length: Math.min(MAX_CONCURRENT_UPLOADS, items.length) },
+    () => runWorker(),
+  )
+  await Promise.all(workers)
+  return results
+}
+
+function uploadResource(files, directory, onProgress) {
   const form = new FormData()
   form.append('path', query.path)
   for (const file of files) {
@@ -152,25 +264,33 @@ function uploadSelection(event, directory) {
     form.append('file', file)
   }
 
-  uploadProgress.value = 0
-  const request = new XMLHttpRequest()
-  request.open('POST', '/api/upload')
-  request.upload.onprogress = progress => {
-    if (progress.lengthComputable && progress.total > 0) {
-      uploadProgress.value = Math.round((progress.loaded / progress.total) * 100)
+  return new Promise(resolve => {
+    const request = new XMLHttpRequest()
+    request.open('POST', '/api/upload')
+    request.upload.onprogress = progress => {
+      if (progress.lengthComputable && progress.total > 0) {
+        onProgress(progress.loaded / progress.total)
+      }
     }
-  }
-  request.onload = async () => {
-    if (request.status >= 200 && request.status < 300) {
-      event.target.value = ''
-      await refreshAfterWrite()
-      status.value = 'Upload complete'
-    } else {
-      status.value = `Upload failed (${request.status})`
+    request.onload = () => {
+      onProgress(1)
+      const ok = request.status >= 200 && request.status < 300
+      let reason = `request failed with status ${request.status}`
+      if (!ok && request.responseText) {
+        try {
+          reason = JSON.parse(request.responseText)?.error?.reason || reason
+        } catch {
+          // Keep the status-based reason for malformed error responses.
+        }
+      }
+      resolve({ ok, status: request.status, reason })
     }
-  }
-  request.onerror = () => { status.value = 'Upload failed' }
-  request.send(form)
+    request.onerror = () => {
+      onProgress(1)
+      resolve({ ok: false, status: 0, reason: 'network request failed' })
+    }
+    request.send(form)
+  })
 }
 
 async function login() {
@@ -264,12 +384,20 @@ onMounted(async () => {
         <button type="button" @click="showPasswordChange = false">Cancel</button>
       </form>
       <div v-if="identity?.actions.upload" class="actions-bar">
-        <button id="upload-file-action" type="button" @click="fileInput.click()">Upload file</button>
-        <input id="upload-file-input" ref="fileInput" type="file" hidden @change="uploadSelection($event, false)">
-        <button id="upload-directory-action" type="button" @click="directoryInput.click()">Upload directory</button>
+        <button id="upload-file-action" type="button" :disabled="uploadInProgress" @click="fileInput.click()">Upload file</button>
+        <input id="upload-file-input" ref="fileInput" type="file" multiple hidden @change="uploadSelection($event, false)">
+        <button id="upload-directory-action" type="button" :disabled="uploadInProgress" @click="directoryInput.click()">Upload directory</button>
         <input id="upload-directory-input" ref="directoryInput" type="file" webkitdirectory multiple hidden @change="uploadSelection($event, true)">
         <button id="create-directory-action" type="button" @click="showCreateDirectory = true">Create directory</button>
         <progress id="upload-progress" :value="uploadProgress" max="100">{{ uploadProgress }}%</progress>
+        <button
+          v-for="failedUpload in failedUploads"
+          :key="failedUpload.id"
+          type="button"
+          :disabled="uploadInProgress"
+          :aria-label="`Retry upload ${failedUpload.name}`"
+          @click="retryUpload(failedUpload)"
+        >Retry {{ failedUpload.name }}</button>
       </div>
       <form v-if="showCreateDirectory" id="create-directory-form" class="login" @submit.prevent="createDirectory">
         <label>Directory name <input id="create-directory-name" v-model="createDirectoryName" required maxlength="255"></label>

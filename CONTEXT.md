@@ -109,7 +109,7 @@ The permission to delete files and recursively delete directories.
 _Avoid_: File-only delete permission, directory-only delete permission
 
 **Directory Upload**:
-An upload that preserves a selected local directory and its nested resources under the current resource path.
+An upload that preserves one selected non-empty local directory and the structure represented by its nested Files under the current resource path. Selecting multiple top-level directories creates multiple Directory Uploads; empty directories are not uploaded.
 _Avoid_: Bulk upload, flattened upload
 
 **Upload Limit**:
@@ -201,7 +201,7 @@ A failed write action reported with the affected resource path and a user-action
 _Avoid_: Generic failure, silent failure
 
 **Atomic Directory Upload**:
-A directory upload that either creates the complete selected directory structure or creates no resources when any part fails.
+A Directory Upload that either creates its complete selected directory structure or creates no resources when any part fails; atomicity does not span multiple selected top-level directories.
 _Avoid_: Partial upload, best-effort upload
 
 **Resource Name**:

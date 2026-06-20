@@ -363,15 +363,20 @@ describe('File Hub browser', () => {
     const wrapper = mount(App)
     await flushPromises()
     const input = wrapper.get('#upload-file-input')
-    Object.defineProperty(input.element, 'files', { value: [new File(['data'], 'report.txt')] })
+    expect(input.attributes('multiple')).toBeDefined()
+    Object.defineProperty(input.element, 'files', {
+      value: [new File(['data'], 'report.txt'), new File(['notes'], 'notes.txt')],
+    })
     await input.trigger('change')
     await flushPromises()
 
-    expect(requests).toHaveLength(1)
+    expect(requests).toHaveLength(2)
     expect([requests[0].method, requests[0].url]).toEqual(['POST', '/api/upload'])
     expect(requests[0].body.get('path')).toBe('')
     expect(requests[0].body.get('file').name).toBe('report.txt')
-    expect(wrapper.get('#upload-progress').attributes('value')).toBe('75')
+    expect(requests[1].body.getAll('file')).toHaveLength(1)
+    expect(requests[1].body.get('file').name).toBe('notes.txt')
+    expect(wrapper.get('#upload-progress').attributes('value')).toBe('100')
     expect(fetch).toHaveBeenLastCalledWith('/api/list?path=&sort=name&order=asc&filter=')
 
     const directoryFile = new File(['nested'], 'guide.txt')
@@ -380,9 +385,147 @@ describe('File Hub browser', () => {
     Object.defineProperty(directoryInput.element, 'files', { value: [directoryFile] })
     await directoryInput.trigger('change')
     await flushPromises()
+    expect(requests).toHaveLength(3)
+    expect(requests[2].body.get('relativePath')).toBe('docs/guide.txt')
+    expect(requests[2].body.get('file').name).toBe('guide.txt')
+  })
+
+  it('limits concurrent File upload transactions to three', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, username: 'writer', actions: { upload: true } }))
+      .mockResolvedValueOnce(jsonResponse(emptyListing()))
+      .mockResolvedValueOnce(jsonResponse(emptyListing()))
+    const requests = []
+    class PendingRequest {
+      constructor() {
+        this.upload = {}
+        requests.push(this)
+      }
+      open() {}
+      send(body) { this.body = body }
+      complete() {
+        this.status = 201
+        this.onload()
+      }
+    }
+    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('XMLHttpRequest', PendingRequest)
+
+    const wrapper = mount(App)
+    await flushPromises()
+    const input = wrapper.get('#upload-file-input')
+    Object.defineProperty(input.element, 'files', {
+      value: ['one', 'two', 'three', 'four'].map(name => new File([name], `${name}.txt`)),
+    })
+    const upload = input.trigger('change')
+    await flushPromises()
+
+    expect(requests).toHaveLength(3)
+    expect(wrapper.get('#upload-file-action').attributes('disabled')).toBeDefined()
+    requests[0].complete()
+    await flushPromises()
+    expect(requests).toHaveLength(4)
+    for (const request of requests.slice(1)) request.complete()
+    await upload
+    await flushPromises()
+    expect(wrapper.get('#upload-file-action').attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).toContain('Upload complete')
+  })
+
+  it('weights multi-File Upload Progress by File size', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, username: 'writer', actions: { upload: true } }))
+      .mockResolvedValueOnce(jsonResponse(emptyListing()))
+      .mockResolvedValueOnce(jsonResponse(emptyListing()))
+    const requests = []
+    class PendingRequest {
+      constructor() {
+        this.upload = {}
+        requests.push(this)
+      }
+      open() {}
+      send() {}
+      progress(loaded, total) {
+        this.upload.onprogress({ lengthComputable: true, loaded, total })
+      }
+      complete() {
+        this.status = 201
+        this.onload()
+      }
+    }
+    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('XMLHttpRequest', PendingRequest)
+
+    const wrapper = mount(App)
+    await flushPromises()
+    const input = wrapper.get('#upload-file-input')
+    Object.defineProperty(input.element, 'files', {
+      value: [new File(['1'], 'small.txt'), new File(['123456789'], 'large.txt')],
+    })
+    const upload = input.trigger('change')
+    await flushPromises()
+
+    requests[0].progress(1, 1)
+    await flushPromises()
+    expect(wrapper.get('#upload-progress').attributes('value')).toBe('10')
+    requests[1].progress(1, 2)
+    await flushPromises()
+    expect(wrapper.get('#upload-progress').attributes('value')).toBe('55')
+    for (const request of requests) request.complete()
+    await upload
+  })
+
+  it('keeps successful File uploads and retries only failed transactions', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, username: 'writer', actions: { upload: true } }))
+      .mockResolvedValueOnce(jsonResponse(emptyListing()))
+      .mockResolvedValueOnce(jsonResponse(emptyListing()))
+      .mockResolvedValueOnce(jsonResponse(emptyListing()))
+    const requests = []
+    let badFileShouldFail = true
+    class FakeRequest {
+      constructor() {
+        this.upload = {}
+        requests.push(this)
+      }
+      open() {}
+      send(body) {
+        this.body = body
+        const name = body.get('file').name
+        this.status = name === 'bad.txt' && badFileShouldFail ? 500 : 201
+        this.responseText = this.status === 500
+          ? JSON.stringify({ error: { reason: 'injected storage failure' } })
+          : ''
+        this.onload()
+      }
+    }
+    vi.stubGlobal('fetch', fetch)
+    vi.stubGlobal('XMLHttpRequest', FakeRequest)
+
+    const wrapper = mount(App)
+    await flushPromises()
+    const input = wrapper.get('#upload-file-input')
+    Object.defineProperty(input.element, 'files', {
+      value: [new File(['good'], 'good.txt'), new File(['bad'], 'bad.txt')],
+    })
+    await input.trigger('change')
+    await flushPromises()
+
     expect(requests).toHaveLength(2)
-    expect(requests[1].body.get('relativePath')).toBe('docs/guide.txt')
-    expect(requests[1].body.get('file').name).toBe('guide.txt')
+    expect(wrapper.text()).toContain('bad.txt')
+    expect(wrapper.text()).toContain('injected storage failure')
+    const retry = wrapper.get('button[aria-label="Retry upload bad.txt"]')
+    badFileShouldFail = false
+    await retry.trigger('click')
+    await flushPromises()
+
+    expect(requests).toHaveLength(3)
+    expect(requests[2].body.get('file').name).toBe('bad.txt')
+    expect(wrapper.find('button[aria-label="Retry upload bad.txt"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('Upload complete')
   })
 })
 

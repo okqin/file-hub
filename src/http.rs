@@ -26,7 +26,7 @@ use tracing::warn;
 use crate::{
     auth::{AuthError, AuthState, BootstrapPassword, BootstrapReport, ManagedUser, PermissionSet},
     config::AppConfig,
-    resource,
+    resource, upload,
 };
 
 const SESSION_COOKIE_NAME: &str = "fh_session";
@@ -54,7 +54,7 @@ pub async fn build_router(config: AppConfig) -> Result<Router, HttpInitError> {
 pub async fn build_router_with_bootstrap_report(
     config: AppConfig,
 ) -> Result<RouterWithBootstrapReport, HttpInitError> {
-    resource::cleanup_staging_remnants(&config).await?;
+    upload::cleanup_staging_remnants(&config).await?;
     let timeout = std::time::Duration::from_secs(
         config
             .limits()
@@ -152,7 +152,7 @@ pub struct RouterWithBootstrapReport {
 pub enum HttpInitError {
     /// Reserved staging remnants could not be cleaned safely.
     #[error("staging cleanup failed")]
-    StagingCleanup(#[from] resource::ResourceError),
+    StagingCleanup(#[from] upload::UploadError),
     /// Authentication/session storage failed to initialize.
     #[error("authentication storage initialization failed")]
     Auth(#[from] AuthError),
@@ -645,141 +645,108 @@ async fn upload_file(
     request: axum::extract::Request,
 ) -> Result<StatusCode, ApiError> {
     require_upload_permission(&state, request.headers()).await?;
-    let mut multipart = Multipart::from_request(request, &state)
+    let multipart = Multipart::from_request(request, &state)
         .await
         .map_err(|_| ApiError::invalid_upload_request())?;
-    let mut path = None;
-    let mut staged_upload: Option<resource::StagedFileUpload> = None;
-    let mut staged_directory: Option<resource::StagedDirectoryUpload> = None;
-    let mut relative_path = None;
-
-    loop {
-        let mut field = match multipart.next_field().await {
-            Ok(Some(field)) => field,
-            Ok(None) => break,
-            Err(_) => {
-                if let Some(upload) = staged_upload {
-                    upload.abort().await;
-                }
-                return Err(ApiError::invalid_upload_request());
-            }
-        };
-        match field.name() {
-            Some("path") if path.is_none() && staged_upload.is_none() => {
-                let value = read_upload_path(&mut field).await?;
-                path = Some(value);
-            }
-            Some("relativePath") if staged_upload.is_none() && relative_path.is_none() => {
-                let current_path = path
-                    .as_deref()
-                    .ok_or_else(ApiError::invalid_upload_request)?;
-                if staged_directory.is_none() {
-                    staged_directory = Some(
-                        resource::StagedDirectoryUpload::start(&state.config, current_path).await?,
-                    );
-                }
-                relative_path = Some(read_upload_path(&mut field).await?);
-            }
-            Some("file") if staged_directory.is_some() => {
-                let relative_path = relative_path
-                    .take()
-                    .ok_or_else(ApiError::invalid_upload_request)?;
-                let upload = staged_directory
-                    .as_mut()
-                    .ok_or_else(ApiError::invalid_upload_request)?;
-                stage_directory_file(upload, &relative_path, &mut field).await?;
-            }
-            Some("file") if staged_upload.is_none() => {
-                let current_path = path
-                    .as_deref()
-                    .ok_or_else(ApiError::invalid_upload_request)?;
-                staged_upload = Some(stage_file(&state.config, current_path, &mut field).await?);
-            }
-            _ => {
-                if let Some(upload) = staged_upload {
-                    upload.abort().await;
-                }
-                return Err(ApiError::invalid_upload_request());
-            }
-        }
-    }
-
-    if let Some(upload) = staged_directory {
-        if relative_path.is_some() || staged_upload.is_some() {
-            upload.abort().await;
-            return Err(ApiError::invalid_upload_request());
-        }
-        upload.commit().await?;
-        return Ok(StatusCode::CREATED);
-    }
-
-    staged_upload
-        .ok_or_else(ApiError::invalid_upload_request)?
-        .commit()
-        .await?;
+    upload::execute(&state.config, MultipartUploadInput { multipart }).await?;
     Ok(StatusCode::CREATED)
 }
 
-async fn stage_directory_file(
-    upload: &mut resource::StagedDirectoryUpload,
-    relative_path: &str,
-    field: &mut Field<'_>,
-) -> Result<(), ApiError> {
-    upload.start_file(relative_path).await?;
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|_| ApiError::invalid_upload_request())?
-    {
-        upload.write_chunk(&chunk).await?;
-    }
-    upload.finish_file().await?;
-    Ok(())
+#[derive(Debug)]
+struct MultipartUploadInput {
+    multipart: Multipart,
 }
 
-async fn stage_file(
-    config: &AppConfig,
-    current_path: &str,
-    field: &mut Field<'_>,
-) -> Result<resource::StagedFileUpload, ApiError> {
-    let filename = field
-        .file_name()
-        .map(str::to_owned)
-        .ok_or_else(ApiError::invalid_upload_request)?;
-    let mut upload = resource::StagedFileUpload::start(config, current_path, &filename).await?;
-    loop {
-        let Ok(chunk) = field.chunk().await else {
-            upload.abort().await;
-            return Err(ApiError::invalid_upload_request());
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        if let Err(error) = upload.write_chunk(&chunk).await {
-            upload.abort().await;
-            return Err(error.into());
+impl upload::UploadInput for MultipartUploadInput {
+    async fn consume(
+        mut self,
+        receiver: &mut upload::UploadReceiver<'_>,
+    ) -> Result<(), upload::UploadError> {
+        let mut path_field = next_upload_field(&mut self.multipart).await?;
+        if path_field.name() != Some("path") {
+            return Err(upload::UploadError::InvalidInput);
         }
+        let current_path = read_upload_path(&mut path_field).await?;
+        drop(path_field);
+        let mut field = next_upload_field(&mut self.multipart).await?;
+
+        match field.name() {
+            Some("file") => {
+                let filename = field
+                    .file_name()
+                    .map(str::to_owned)
+                    .ok_or(upload::UploadError::InvalidInput)?;
+                receiver
+                    .begin(&current_path, upload::UploadKind::File)
+                    .await?;
+                receiver.receive_file(&filename, field).await?;
+                if next_optional_upload_field(&mut self.multipart)
+                    .await?
+                    .is_some()
+                {
+                    return Err(upload::UploadError::InvalidInput);
+                }
+            }
+            Some("relativePath") => {
+                receiver
+                    .begin(&current_path, upload::UploadKind::Directory)
+                    .await?;
+                loop {
+                    let relative_path = read_upload_path(&mut field).await?;
+                    drop(field);
+                    let file = next_upload_field(&mut self.multipart).await?;
+                    if file.name() != Some("file") {
+                        return Err(upload::UploadError::InvalidInput);
+                    }
+                    receiver.receive_file(&relative_path, file).await?;
+                    let Some(next_field) = next_optional_upload_field(&mut self.multipart).await?
+                    else {
+                        break;
+                    };
+                    if next_field.name() != Some("relativePath") {
+                        return Err(upload::UploadError::InvalidInput);
+                    }
+                    field = next_field;
+                }
+            }
+            _ => return Err(upload::UploadError::InvalidInput),
+        }
+        Ok(())
     }
-    Ok(upload)
 }
 
-async fn read_upload_path(field: &mut Field<'_>) -> Result<String, ApiError> {
+async fn next_upload_field(multipart: &mut Multipart) -> Result<Field<'_>, upload::UploadError> {
+    next_optional_upload_field(multipart)
+        .await?
+        .ok_or(upload::UploadError::InvalidInput)
+}
+
+async fn next_optional_upload_field(
+    multipart: &mut Multipart,
+) -> Result<Option<Field<'_>>, upload::UploadError> {
+    multipart
+        .next_field()
+        .await
+        .map_err(|error| upload::UploadError::InputRead(Box::new(error)))
+}
+
+async fn read_upload_path(field: &mut Field<'_>) -> Result<String, upload::UploadError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = field
         .chunk()
         .await
-        .map_err(|_| ApiError::invalid_upload_request())?
+        .map_err(|error| upload::UploadError::InputRead(Box::new(error)))?
     {
         let next_length = bytes
             .len()
             .checked_add(chunk.len())
-            .ok_or_else(ApiError::invalid_upload_request)?;
+            .ok_or(upload::UploadError::InvalidInput)?;
         if next_length > resource::MAX_RESOURCE_PATH_BYTES {
-            return Err(ApiError::invalid_upload_request());
+            return Err(upload::UploadError::InvalidInput);
         }
         bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8(bytes).map_err(|_| ApiError::invalid_upload_request())
+    String::from_utf8(bytes).map_err(|_| upload::UploadError::InvalidInput)
 }
 
 async fn require_upload_permission(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -935,22 +902,10 @@ impl From<resource::ResourceError> for ApiError {
                 Self::from_resource_limit_error(&error)
             }
             resource::ResourceError::InvalidResourceName => Self::invalid_resource_name(),
-            error @ (resource::ResourceError::InvalidDirectoryUploadPath { .. }
-            | resource::ResourceError::DirectoryUploadConflict { .. }
-            | resource::ResourceError::DirectoryUploadSingleFileSizeLimitExceeded {
-                ..
-            }
-            | resource::ResourceError::DirectoryUploadTotalSizeLimitExceeded { .. }
-            | resource::ResourceError::DirectoryUploadResourceCountLimitExceeded {
-                ..
-            }) => Self::from_directory_upload_error(error),
             error @ (resource::ResourceError::InvalidWriteResourceName
             | resource::ResourceError::NameConflict
             | resource::ResourceError::CreateDirectory(_)
-            | resource::ResourceError::RenameResource(_)
-            | resource::ResourceError::UploadSingleFileSizeLimitExceeded { .. }
-            | resource::ResourceError::UploadTotalSizeLimitExceeded { .. }
-            | resource::ResourceError::StoreUpload(_)) => Self::from_write_error(&error),
+            | resource::ResourceError::RenameResource(_)) => Self::from_write_error(&error),
             resource::ResourceError::DeleteResource {
                 path,
                 operation,
@@ -974,6 +929,107 @@ impl From<resource::ResourceError> for ApiError {
                 code: "resource_listing_failed",
                 path: None,
                 reason: "failed to read Resource".to_owned(),
+            },
+        }
+    }
+}
+
+impl From<upload::UploadError> for ApiError {
+    fn from(error: upload::UploadError) -> Self {
+        match error {
+            upload::UploadError::InvalidInput | upload::UploadError::InputRead(_) => {
+                Self::invalid_upload_request()
+            }
+            upload::UploadError::InvalidResourcePath => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_resource_path",
+                path: None,
+                reason: "resource path is invalid".to_owned(),
+            },
+            upload::UploadError::NotDirectory => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "not_directory",
+                path: None,
+                reason: "resource path is not a directory".to_owned(),
+            },
+            upload::UploadError::ResourceNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "resource_not_found",
+                path: None,
+                reason: "resource path does not exist".to_owned(),
+            },
+            upload::UploadError::InvalidWriteResourceName => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_resource_name",
+                path: None,
+                reason: "Resource Name is invalid".to_owned(),
+            },
+            upload::UploadError::InvalidDirectoryUploadPath { path } => Self {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_directory_upload_path",
+                path: Some(path),
+                reason: "relative path contains an invalid Resource Name".to_owned(),
+            },
+            upload::UploadError::DirectoryUploadConflict { path } => Self {
+                status: StatusCode::CONFLICT,
+                code: "directory_upload_conflict",
+                path: Some(path),
+                reason: "Directory Upload conflicts with an existing Resource".to_owned(),
+            },
+            upload::UploadError::DirectoryUploadSingleFileSizeLimitExceeded { path, limit } => {
+                Self {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "directory_upload_single_file_size_limit_exceeded",
+                    path: Some(path),
+                    reason: format!(
+                        "File exceeds the configured Directory Upload single-file limit of \
+                         {limit} bytes"
+                    ),
+                }
+            }
+            upload::UploadError::DirectoryUploadTotalSizeLimitExceeded { path, limit } => Self {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "directory_upload_total_size_limit_exceeded",
+                path: Some(path),
+                reason: format!(
+                    "File causes the Directory Upload total size limit of {limit} bytes to be \
+                     exceeded"
+                ),
+            },
+            upload::UploadError::DirectoryUploadResourceCountLimitExceeded { path, limit } => {
+                Self {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "directory_upload_resource_count_limit_exceeded",
+                    path: Some(path),
+                    reason: format!(
+                        "Resource causes the Directory Upload count limit of {limit} to be \
+                         exceeded"
+                    ),
+                }
+            }
+            upload::UploadError::NameConflict => Self {
+                status: StatusCode::CONFLICT,
+                code: "name_conflict",
+                path: None,
+                reason: "Resource Name conflicts with an existing Resource".to_owned(),
+            },
+            upload::UploadError::UploadSingleFileSizeLimitExceeded { limit } => Self {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "upload_single_file_size_limit_exceeded",
+                path: None,
+                reason: format!("uploaded File exceeds configured size limit of {limit} bytes"),
+            },
+            upload::UploadError::UploadTotalSizeLimitExceeded { limit } => Self {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "upload_total_size_limit_exceeded",
+                path: None,
+                reason: format!("upload exceeds configured total size limit of {limit} bytes"),
+            },
+            upload::UploadError::Store(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "upload_failed",
+                path: None,
+                reason: "failed to store uploaded File".to_owned(),
             },
         }
     }
@@ -1114,57 +1170,6 @@ impl ApiError {
         }
     }
 
-    fn from_directory_upload_error(error: resource::ResourceError) -> Self {
-        match error {
-            resource::ResourceError::InvalidDirectoryUploadPath { path } => Self {
-                status: StatusCode::BAD_REQUEST,
-                code: "invalid_directory_upload_path",
-                path: Some(path),
-                reason: "relative path contains an invalid Resource Name".to_owned(),
-            },
-            resource::ResourceError::DirectoryUploadConflict { path } => Self {
-                status: StatusCode::CONFLICT,
-                code: "directory_upload_conflict",
-                path: Some(path),
-                reason: "Directory Upload conflicts with an existing Resource".to_owned(),
-            },
-            resource::ResourceError::DirectoryUploadSingleFileSizeLimitExceeded { path, limit } => {
-                Self {
-                    status: StatusCode::PAYLOAD_TOO_LARGE,
-                    code: "directory_upload_single_file_size_limit_exceeded",
-                    path: Some(path),
-                    reason: format!(
-                        "File exceeds the configured Directory Upload single-file limit of \
-                         {limit} bytes"
-                    ),
-                }
-            }
-            resource::ResourceError::DirectoryUploadTotalSizeLimitExceeded { path, limit } => {
-                Self {
-                    status: StatusCode::PAYLOAD_TOO_LARGE,
-                    code: "directory_upload_total_size_limit_exceeded",
-                    path: Some(path),
-                    reason: format!(
-                        "File causes the Directory Upload total size limit of {limit} bytes to be \
-                         exceeded"
-                    ),
-                }
-            }
-            resource::ResourceError::DirectoryUploadResourceCountLimitExceeded { path, limit } => {
-                Self {
-                    status: StatusCode::PAYLOAD_TOO_LARGE,
-                    code: "directory_upload_resource_count_limit_exceeded",
-                    path: Some(path),
-                    reason: format!(
-                        "Resource causes the Directory Upload count limit of {limit} to be \
-                         exceeded"
-                    ),
-                }
-            }
-            _ => Self::internal_server_error(),
-        }
-    }
-
     fn from_write_error(error: &resource::ResourceError) -> Self {
         match error {
             resource::ResourceError::InvalidWriteResourceName => Self {
@@ -1190,24 +1195,6 @@ impl ApiError {
                 code: "rename_failed",
                 path: None,
                 reason: "failed to rename Resource".to_owned(),
-            },
-            resource::ResourceError::UploadSingleFileSizeLimitExceeded { limit } => Self {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                code: "upload_single_file_size_limit_exceeded",
-                path: None,
-                reason: format!("uploaded File exceeds configured size limit of {limit} bytes"),
-            },
-            resource::ResourceError::UploadTotalSizeLimitExceeded { limit } => Self {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                code: "upload_total_size_limit_exceeded",
-                path: None,
-                reason: format!("upload exceeds configured total size limit of {limit} bytes"),
-            },
-            resource::ResourceError::StoreUpload(_) => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "upload_failed",
-                path: None,
-                reason: "failed to store uploaded File".to_owned(),
             },
             _ => Self::internal_server_error(),
         }

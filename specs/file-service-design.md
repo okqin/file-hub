@@ -82,11 +82,15 @@ axum + tower (router, body limit, timeout, rate limit, session)
 - 根目录无归档操作(根不是可操作资源)。
 
 ### 5.3 上传与原子性(ADR 0003)
-- **协议**:`multipart/form-data`。目录上传用 `<input webkitdirectory>`,每个 part 携带 `webkitRelativePath`。后端流式解析 multipart。
+- **协议**:`multipart/form-data`。每个请求只描述一个顶层 Resource。File Upload 严格使用 `path + file`;Directory Upload 严格使用 `path + (relativePath + file)+`。adapter 根据首个内容字段识别类型,并拒绝乱序、重复 `path`、不完整字段对、未知字段和混合类型。空 Directory 不属于上传输入;后端始终流式解析 multipart。
+- **事务 interface**:HTTP adapter 按 File 将协议无关的名称或相对路径及异步内容流交给上传事务 module;module 不理解 multipart 字段名,也不向 adapter 暴露 staging 的 start/write/finish/commit/abort lifecycle。输入正常结束时由 module 内部发布;输入解析或读取失败时由 module 内部 rollback。
+- **Directory 结构**:Directory Upload 的 Directory 结构仅从 File 相对路径推导;不接受独立的 Directory 条目。同一路径分别被 File 和其余 File 的父 Directory 占用时为 Name Conflict。
+- **资源计数**:Directory Upload 的每个唯一 File 与从路径推导出的 Directory 都计数一次,包括顶层 Directory。超限错误保留触发失败的首个完整相对路径。
 - **staging**:写入存储根内保留目录 `.fh-staging/`(与目标同挂载点,保证 `rename` 原子)。全部校验(conflict / limit / `ResourceName`)在落目标前完成。
-- **目录上传原子性**:完整结构 stage 通过后,一次 `rename` 落目标;任一步失败则清理 staging,零资源落地。失败至少报告**首个**失败相对路径 + 原因。
+- **目录上传原子性**:完整结构 stage 通过后,一次 no-replace `rename` 落目标,由该原子操作最终裁决并发 Name Conflict;任一步失败则清理 staging,目标 Resource 始终不可见。失败至少报告**首个**失败相对路径 + 原因。
 - **单文件上传**:同走 staging + rename,半截上传永不可见。
-- **进度**:前端用 `XMLHttpRequest` + `upload.onprogress`(C69/FF59 不支持 fetch 上传进度)。目录上传显示整体进度。
+- **多选调度**:多个顶层 Resource 由前端拆成独立请求,最多并发 3 个事务;单个失败不取消其他事务,失败 Resource 可单独重试。当前 File chooser 支持多选;Directory chooser 仍选择一个顶层 Directory,后续拖拽多 Directory 复用同一调度器。
+- **进度**:前端用 `XMLHttpRequest` + `upload.onprogress`(C69/FF59 不支持 fetch 上传进度)。多选整体进度按各 Resource 的 File 总字节数加权;全部为零字节时按已完成事务数计算。
 - **limit**:单文件 size、总上传 size、目录上传资源 count 三项,服务端强制。
 
 ### 5.4 删除
